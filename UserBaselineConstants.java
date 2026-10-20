@@ -13,6 +13,12 @@ public final class UserBaselineConstants {
     public static final String STATUS_CORRECTED = "CORRECTED";
     public static final String STATUS_UNCORRECTABLE = "UNCORRECTABLE";
 
+    public static final String SYNC_PENDING = "PENDING";
+    public static final String SYNCED = "SYNCED";
+
+    public static final String HOLIDAY_NATIONAL_DAY = "NATIONAL_DAY";
+    public static final String HOLIDAY_MID_AUTUMN = "MID_AUTUMN";
+
     public static final String TASK_PENDING = "PENDING";
     public static final String TASK_PROCESSING = "PROCESSING";
     public static final String TASK_RETRY_WAIT = "RETRY_WAIT";

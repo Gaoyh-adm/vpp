@@ -3,6 +3,7 @@ package com.vpp.platform.resource.baseline;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.vpp.framework.commons.JacksonUtils;
 import com.vpp.platform.resource.baseline.model.CorrectionResult;
+import com.vpp.platform.resource.baseline.model.InitialBaselineSeed;
 import com.vpp.platform.resource.baseline.model.UserLoadPoint;
 import com.vpp.platform.resource.baseline.model.WindowValueTrace;
 import com.vpp.platform.resource.entity.UserBaselineCorrectionTask;
@@ -16,7 +17,6 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.math.BigDecimal;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -35,11 +35,17 @@ public class UserBaselineCorrectionService {
     private final UserBaselineSourceMapper sourceMapper;
     private final UserBaselineLoadMapper loadMapper;
     private final UserBaselineLoadStore loadStore;
+    private final UserBaselineInitialWindowService initialWindowService;
     private final UserBaselinePointCalculator pointCalculator;
     private final UserBaselineStorageSupport storageSupport;
     private final UserBaselineProperties properties;
 
-    /** 查询并执行已经到达目标时刻的修正任务。 */
+    /**
+     * 查询并执行已经到达目标时刻的修正任务。
+     *
+     * @return 本次成功完成的任务数
+     * @throws IllegalStateException 任一任务发生系统异常并进入等待重试时抛出
+     */
     public int correctDueTasks() {
         List<UserBaselineCorrectionTask> tasks = taskMapper.selectList(
                 new LambdaQueryWrapper<UserBaselineCorrectionTask>()
@@ -85,10 +91,9 @@ public class UserBaselineCorrectionService {
             throw new IllegalStateException("用户基线修正任务当前状态不允许消费，任务ID=" + taskId);
         }
 
-        int success = countCompletedDetails(task, UserBaselineConstants.STATUS_CORRECTED);
-        int failed = countCompletedDetails(task, UserBaselineConstants.STATUS_UNCORRECTABLE);
-        long lastId = 0L;
         try {
+            syncPendingDetails(task);
+            long lastId = 0L;
             while (true) {
                 List<UserBaselineDetail> details = detailMapper.selectList(
                         new LambdaQueryWrapper<UserBaselineDetail>()
@@ -102,10 +107,23 @@ public class UserBaselineCorrectionService {
                 if (details == null || details.isEmpty()) {
                     break;
                 }
-                BatchCount count = correctBatch(task, details);
-                success += count.success();
-                failed += count.failed();
+                calculateBatch(task, details);
+                syncDetails(details);
                 lastId = details.get(details.size() - 1).getId();
+            }
+            syncPendingDetails(task);
+            long waiting = countDetails(task, UserBaselineConstants.STATUS_WAITING, null);
+            long pendingSync = countPendingSyncDetails(task);
+            if (waiting > 0 || pendingSync > 0) {
+                throw new IllegalStateException("用户基线修正任务仍有待计算" + waiting
+                        + "条、待同步" + pendingSync + "条，不能标记成功。");
+            }
+            int success = countCompletedDetails(task, UserBaselineConstants.STATUS_CORRECTED);
+            int failed = countCompletedDetails(task, UserBaselineConstants.STATUS_UNCORRECTABLE);
+            int expected = task.getTotalCount() == null ? 0 : task.getTotalCount();
+            if (success + failed != expected) {
+                throw new IllegalStateException("用户基线修正任务要求同步" + expected + "条，实际已确认同步"
+                        + (success + failed) + "条，不能标记成功。");
             }
             task.setStatus(UserBaselineConstants.TASK_SUCCESS);
             task.setSuccessCount(success);
@@ -122,7 +140,7 @@ public class UserBaselineCorrectionService {
         }
     }
 
-    private BatchCount correctBatch(UserBaselineCorrectionTask task, List<UserBaselineDetail> details) {
+    private void calculateBatch(UserBaselineCorrectionTask task, List<UserBaselineDetail> details) {
         List<String> consNos = details.stream().map(UserBaselineDetail::getConsNo).distinct().toList();
         LocalDateTime targetTime = task.getTargetTime();
         LocalDateTime queryStart = targetTime.minusHours(8);
@@ -132,11 +150,24 @@ public class UserBaselineCorrectionService {
                 Timestamp.valueOf(queryStart), Timestamp.valueOf(targetTime));
         Map<String, Map<LocalDateTime, UserLoadPoint>> actualByUser = actualMap(actualRows);
         Map<String, Map<LocalDateTime, UserBaselineLoad>> baselineByUser = baselineMap(baselineRows);
-        Map<String, Map<Integer, UserBaselineDetail>> seeds = seedMap(details.get(0).getDataDate(), consNos);
+        Map<String, Map<LocalDateTime, InitialBaselineSeed>> seeds =
+                initialWindowService.findByUsers(consNos, task.getCalcVersion());
+        List<UserBaselineDetail> needInitialization = new ArrayList<>();
+        for (UserBaselineDetail detail : details) {
+            if (seeds.containsKey(detail.getConsNo())) {
+                continue;
+            }
+            WindowBuild probe = buildBaselineWindow(targetTime,
+                    baselineByUser.getOrDefault(detail.getConsNo(), Map.of()), Map.of());
+            if (probe.missingTime() != null) {
+                needInitialization.add(detail);
+            }
+        }
+        if (!needInitialization.isEmpty()) {
+            seeds.putAll(initialWindowService.initializeOnce(
+                    needInitialization, targetTime, task.getCalcVersion()));
+        }
 
-        int success = 0;
-        int failed = 0;
-        List<UserBaselineLoad> updates = new ArrayList<>();
         for (UserBaselineDetail detail : details) {
             WindowBuild actualWindow = buildActualWindow(targetTime,
                     actualByUser.getOrDefault(detail.getConsNo(), Map.of()));
@@ -170,25 +201,40 @@ public class UserBaselineCorrectionService {
             detail.setCorrectionStatus(result.status());
             detail.setCalculationRemark(detail.getCalculationRemark() + result.chineseRemark());
             detail.setCorrectedAt(correctedAt);
-            detailMapper.updateById(detail);
-            updates.add(toUpdatedLoad(detail));
-            if (UserBaselineConstants.STATUS_CORRECTED.equals(result.status())) {
-                success++;
-            } else {
-                failed++;
+            detail.setSyncStatus(UserBaselineConstants.SYNC_PENDING);
+            detail.setSyncedAt(null);
+            if (detailMapper.updateById(detail) != 1) {
+                throw new IllegalStateException("用户基线修正结果保存失败，明细ID=" + detail.getId());
             }
         }
-        loadStore.upsertPoints(updates);
-        return new BatchCount(success, failed);
     }
 
     private int countCompletedDetails(UserBaselineCorrectionTask task, String correctionStatus) {
+        return Math.toIntExact(countDetails(task, correctionStatus, UserBaselineConstants.SYNCED));
+    }
+
+    private long countDetails(UserBaselineCorrectionTask task, String correctionStatus, String syncStatus) {
+        LambdaQueryWrapper<UserBaselineDetail> wrapper = new LambdaQueryWrapper<UserBaselineDetail>()
+                .eq(UserBaselineDetail::getDataDate, task.getDataDate())
+                .eq(UserBaselineDetail::getSlotNo, task.getSlotNo())
+                .eq(UserBaselineDetail::getCalcVersion, task.getCalcVersion())
+                .eq(UserBaselineDetail::getCorrectionStatus, correctionStatus);
+        if (syncStatus != null) {
+            wrapper.eq(UserBaselineDetail::getSyncStatus, syncStatus);
+        }
+        Long count = detailMapper.selectCount(wrapper);
+        return count == null ? 0L : count;
+    }
+
+    private long countPendingSyncDetails(UserBaselineCorrectionTask task) {
         Long count = detailMapper.selectCount(new LambdaQueryWrapper<UserBaselineDetail>()
                 .eq(UserBaselineDetail::getDataDate, task.getDataDate())
                 .eq(UserBaselineDetail::getSlotNo, task.getSlotNo())
                 .eq(UserBaselineDetail::getCalcVersion, task.getCalcVersion())
-                .eq(UserBaselineDetail::getCorrectionStatus, correctionStatus));
-        return count == null ? 0 : Math.toIntExact(count);
+                .in(UserBaselineDetail::getCorrectionStatus,
+                        UserBaselineConstants.STATUS_CORRECTED, UserBaselineConstants.STATUS_UNCORRECTABLE)
+                .eq(UserBaselineDetail::getSyncStatus, UserBaselineConstants.SYNC_PENDING));
+        return count == null ? 0L : count;
     }
 
     private WindowBuild buildActualWindow(LocalDateTime targetTime,
@@ -231,8 +277,8 @@ public class UserBaselineCorrectionService {
     }
 
     private WindowBuild buildBaselineWindow(LocalDateTime targetTime,
-                                            Map<LocalDateTime, UserBaselineLoad> source,
-                                            Map<Integer, UserBaselineDetail> seeds) {
+                                             Map<LocalDateTime, UserBaselineLoad> source,
+                                             Map<LocalDateTime, InitialBaselineSeed> seeds) {
         List<WindowValueTrace> result = new ArrayList<>(UserBaselineConstants.WINDOW_POINTS);
         for (int i = UserBaselineConstants.WINDOW_POINTS; i >= 1; i--) {
             LocalDateTime pointTime = targetTime.minusMinutes(i * 15L);
@@ -263,28 +309,23 @@ public class UserBaselineCorrectionService {
                         "历史最终基线缺失，采用最近有效前值", "前值", distance));
                 continue;
             }
-            int slot = slotForTime(pointTime);
-            UserBaselineDetail seed = seeds.get(slot);
-            if (seed == null || seed.getRawBaselineMw() == null) {
+            InitialBaselineSeed seed = seeds.get(pointTime);
+            if (seed == null || seed.rawResult() == null) {
                 return new WindowBuild(result, pointTime);
             }
-            result.add(new WindowValueTrace(pointTime, seed.getTargetTime(), seed.getRawBaselineMw(),
-                    "首次启动缺少历史最终基线，采用当日同点原始基线作为初始化种子", "初始化种子", 0));
+            if (seed.rawResult().rawBaseline() == null) {
+                result.add(new WindowValueTrace(pointTime, seed.pointTime(), null,
+                        "首次初始化已按历史业务日期" + seed.dataDate() + "第" + seed.slotNo()
+                                + "点计算B0，但未取得有效结果；" + seed.rawResult().chineseRemark(),
+                        "初始化失败", 0));
+                return new WindowBuild(result, pointTime);
+            }
+            result.add(new WindowValueTrace(pointTime, seed.pointTime(), seed.rawResult().rawBaseline(),
+                    "首次启动缺少历史最终基线，采用历史业务日期" + seed.dataDate() + "第"
+                            + seed.slotNo() + "点单独计算并保存的B0；" + seed.rawResult().chineseRemark(),
+                    "初始化种子", 0));
         }
         return new WindowBuild(result, null);
-    }
-
-    private Map<String, Map<Integer, UserBaselineDetail>> seedMap(java.time.LocalDate dataDate,
-                                                                 List<String> consNos) {
-        List<UserBaselineDetail> rows = detailMapper.selectList(new LambdaQueryWrapper<UserBaselineDetail>()
-                .eq(UserBaselineDetail::getDataDate, dataDate)
-                .eq(UserBaselineDetail::getCalcVersion, properties.getCalcVersion())
-                .in(UserBaselineDetail::getConsNo, consNos));
-        Map<String, Map<Integer, UserBaselineDetail>> result = new HashMap<>();
-        for (UserBaselineDetail row : rows) {
-            result.computeIfAbsent(row.getConsNo(), ignored -> new HashMap<>()).put(row.getSlotNo(), row);
-        }
-        return result;
     }
 
     private Map<String, Map<LocalDateTime, UserLoadPoint>> actualMap(List<UserLoadPoint> rows) {
@@ -305,6 +346,44 @@ public class UserBaselineCorrectionService {
                             .put(row.getTs().toLocalDateTime(), row));
         }
         return result;
+    }
+
+    // 优先补写已经计算完成但尚未同步到TDengine的原结果，不重新计算K。
+    private void syncPendingDetails(UserBaselineCorrectionTask task) {
+        long lastId = 0L;
+        while (true) {
+            List<UserBaselineDetail> pending = detailMapper.selectList(
+                    new LambdaQueryWrapper<UserBaselineDetail>()
+                            .eq(UserBaselineDetail::getDataDate, task.getDataDate())
+                            .eq(UserBaselineDetail::getSlotNo, task.getSlotNo())
+                            .eq(UserBaselineDetail::getCalcVersion, task.getCalcVersion())
+                            .in(UserBaselineDetail::getCorrectionStatus,
+                                    UserBaselineConstants.STATUS_CORRECTED,
+                                    UserBaselineConstants.STATUS_UNCORRECTABLE)
+                            .eq(UserBaselineDetail::getSyncStatus, UserBaselineConstants.SYNC_PENDING)
+                            .gt(UserBaselineDetail::getId, lastId)
+                            .orderByAsc(UserBaselineDetail::getId)
+                            .last("LIMIT " + Math.max(1, properties.getUserBatchSize())));
+            if (pending == null || pending.isEmpty()) {
+                return;
+            }
+            syncDetails(pending);
+            lastId = pending.get(pending.size() - 1).getId();
+        }
+    }
+
+    // TDengine幂等覆盖成功后，逐条确认MySQL同步状态。
+    private void syncDetails(List<UserBaselineDetail> details) {
+        List<UserBaselineLoad> rows = details.stream().map(this::toUpdatedLoad).toList();
+        loadStore.upsertPoints(rows);
+        LocalDateTime syncedAt = LocalDateTime.now();
+        for (UserBaselineDetail detail : details) {
+            detail.setSyncStatus(UserBaselineConstants.SYNCED);
+            detail.setSyncedAt(syncedAt);
+            if (detailMapper.updateById(detail) != 1) {
+                throw new IllegalStateException("TDengine写入成功，但MySQL同步状态确认失败，明细ID=" + detail.getId());
+            }
+        }
     }
 
     private UserBaselineLoad toUpdatedLoad(UserBaselineDetail detail) {
@@ -335,11 +414,6 @@ public class UserBaselineCorrectionService {
                 null, detail.getRawBaselineMw(), actual, baseline, remark);
     }
 
-    private int slotForTime(LocalDateTime time) {
-        int minute = time.getHour() * 60 + time.getMinute();
-        return minute == 0 ? UserBaselineConstants.POINTS_PER_DAY : minute / 15;
-    }
-
     private String chineseSource(String sourceType) {
         if (sourceType == null || sourceType.isBlank()) {
             return "负荷来源类型未标注";
@@ -356,6 +430,4 @@ public class UserBaselineCorrectionService {
     private record WindowBuild(List<WindowValueTrace> values, LocalDateTime missingTime) {
     }
 
-    private record BatchCount(int success, int failed) {
-    }
 }

@@ -101,11 +101,14 @@ public class HolidayCalendarSyncService {
         row.setIsAdjustedWorkday(adjustedWorkday);
         row.setHolidayName(exception == null ? null : exception.name());
         if (UserBaselineConstants.DAY_HOLIDAY.equals(dayType)) {
-            row.setHolidayCode(exception.name());
-            row.setHolidayGroupCode(exception.name());
+            row.setHolidayCode(hasText(exception.holidayCode()) ? exception.holidayCode() : exception.name());
+            row.setHolidayGroupCode(hasText(exception.holidayGroupCode())
+                    ? exception.holidayGroupCode() : exception.name());
+            row.setFestivalTags(exception.festivalTags());
         } else {
             row.setHolidayCode(null);
             row.setHolidayGroupCode(null);
+            row.setFestivalTags(null);
         }
         row.setSourceUrl(sourceUrl);
         row.setSourceVersion(sourceVersion);
@@ -128,9 +131,35 @@ public class HolidayCalendarSyncService {
                 throw new IllegalStateException("本地节假日日历存在缺少date、name或isOffDay的记录。");
             }
             LocalDate date = LocalDate.parse(node.get("date").asText());
-            result.put(date, new HolidayException(node.get("name").asText(), node.get("isOffDay").asBoolean()));
+            result.put(date, new HolidayException(node.get("name").asText(), node.get("isOffDay").asBoolean(),
+                    text(node, "holidayCode"), text(node, "holidayGroupCode"), tags(node.get("festivalTags"))));
         }
         return result;
+    }
+
+    private String text(JsonNode node, String fieldName) {
+        JsonNode value = node.get(fieldName);
+        return value == null || value.isNull() ? null : value.asText();
+    }
+
+    private String tags(JsonNode value) {
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (!value.isArray()) {
+            throw new IllegalStateException("本地节假日日历的festivalTags必须是数组。");
+        }
+        List<String> tags = new java.util.ArrayList<>();
+        for (JsonNode tag : value) {
+            if (tag != null && !tag.asText().isBlank()) {
+                tags.add(tag.asText().trim());
+            }
+        }
+        return tags.isEmpty() ? null : String.join(",", tags);
+    }
+
+    private boolean hasText(String value) {
+        return value != null && !value.isBlank();
     }
 
     private byte[] readLocalCalendar(String resourcePath) {
@@ -164,6 +193,10 @@ public class HolidayCalendarSyncService {
         }
     }
 
-    private record HolidayException(String name, boolean offDay) {
+    private record HolidayException(String name,
+                                    boolean offDay,
+                                    String holidayCode,
+                                    String holidayGroupCode,
+                                    String festivalTags) {
     }
 }

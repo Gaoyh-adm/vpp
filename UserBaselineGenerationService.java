@@ -177,6 +177,12 @@ public class UserBaselineGenerationService {
             String consNo = rows.details().getFirst().getConsNo();
             try {
                 loadStore.replaceUserDate(consNo, dataDate, rows.loads());
+                int synced = detailMapper.markUserDateSynced(dataDate, consNo, properties.getCalcVersion(),
+                        LocalDateTime.now());
+                if (synced != rows.details().size()) {
+                    throw new IllegalStateException("户号" + consNo + "原始基线已写入TDengine，但MySQL同步状态更新数量异常，"
+                            + "期望" + rows.details().size() + "条，实际" + synced + "条。");
+                }
                 rows.details().stream().filter(detail -> Boolean.TRUE.equals(detail.getNeedCorrection()))
                         .forEach(detail -> correctionCounts[detail.getSlotNo()]++);
                 success++;
@@ -234,6 +240,7 @@ public class UserBaselineGenerationService {
                     .traceCode(traceCode)
                     .snapshotTime(snapshotTime)
                     .generatedAt(LocalDateTime.now())
+                    .syncStatus(UserBaselineConstants.SYNC_PENDING)
                     .calcVersion(properties.getCalcVersion())
                     .build();
             details.add(detail);

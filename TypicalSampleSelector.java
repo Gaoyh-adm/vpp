@@ -46,11 +46,9 @@ public class TypicalSampleSelector {
                                                     int maxSamples) {
         List<BaselineCalendarDay> normalDays = scope.stream()
                 .filter(day -> !participationDates.contains(day.getCalendarDate()))
-                .filter(day -> loadsByDate.containsKey(day.getCalendarDate()))
                 .toList();
         List<BaselineCalendarDay> participationDays = scope.stream()
                 .filter(day -> participationDates.contains(day.getCalendarDate()))
-                .filter(day -> loadsByDate.containsKey(day.getCalendarDate()))
                 .toList();
 
         List<TypicalSampleTrace> result = new ArrayList<>();
@@ -67,11 +65,13 @@ public class TypicalSampleSelector {
                                                    Map<LocalDate, Map<Integer, UserLoadPoint>> loadsByDate,
                                                    int slotNo) {
         String targetGroup = holidayGroup(targetDay);
-        List<BaselineCalendarDay> lastYearSameHoliday = historyDaysDesc.stream()
+        List<BaselineCalendarDay> lastYearCandidates = historyDaysDesc.stream()
                 .filter(day -> UserBaselineConstants.DAY_HOLIDAY.equals(day.getDayType()))
                 .filter(day -> day.getCalendarDate().getYear() == targetDay.getCalendarDate().getYear() - 1)
-                .filter(day -> targetGroup.equals(holidayGroup(day)))
+                .filter(day -> sharesHolidayType(targetDay, day))
                 .toList();
+        List<BaselineCalendarDay> lastYearSameHoliday = filterCombinedHolidayDates(
+                targetDay, lastYearCandidates);
 
         List<List<BaselineCalendarDay>> groups = new ArrayList<>();
         if (!lastYearSameHoliday.isEmpty()) {
@@ -91,6 +91,7 @@ public class TypicalSampleSelector {
         List<BaselineCalendarDay> allHolidayDays = historyDaysDesc.stream()
                 .filter(day -> UserBaselineConstants.DAY_HOLIDAY.equals(day.getDayType()))
                 .toList();
+        List<BaselineCalendarDay> fittingSourceDays = filterCombinedHolidayDates(targetDay, allHolidayDays);
         for (List<BaselineCalendarDay> group : groups) {
             List<BaselineCalendarDay> usableDays = group.stream()
                     .filter(day -> !participationDates.contains(day.getCalendarDate()))
@@ -98,7 +99,7 @@ public class TypicalSampleSelector {
                     .toList();
             List<TypicalSampleTrace> samples = new ArrayList<>();
             appendActual(samples, usableDays, loadsByDate, slotNo, "节假日真实值", Integer.MAX_VALUE);
-            appendFitted(samples, usableDays, allHolidayDays, loadsByDate, slotNo,
+            appendFitted(samples, usableDays, fittingSourceDays, loadsByDate, slotNo,
                     "节假日拟合值", Integer.MAX_VALUE);
             if (!samples.isEmpty()) {
                 return samples;
@@ -177,6 +178,76 @@ public class TypicalSampleSelector {
             return day.getHolidayCode();
         }
         return day.getHolidayName() == null ? day.getCalendarDate().toString() : day.getHolidayName();
+    }
+
+    private boolean sharesHolidayType(BaselineCalendarDay targetDay, BaselineCalendarDay sourceDay) {
+        Set<String> targetTypes = holidayTypes(targetDay);
+        Set<String> sourceTypes = holidayTypes(sourceDay);
+        if (!targetTypes.isEmpty() && !sourceTypes.isEmpty()) {
+            return targetTypes.stream().anyMatch(sourceTypes::contains);
+        }
+        return holidayGroup(targetDay).equals(holidayGroup(sourceDay));
+    }
+
+    private boolean isExcludedMidAutumnDate(BaselineCalendarDay targetDay, BaselineCalendarDay sourceDay) {
+        Set<String> targetTypes = holidayTypes(targetDay);
+        Set<String> sourceTypes = holidayTypes(sourceDay);
+        if (!containsNationalDay(targetTypes)
+                || !containsNationalDay(sourceTypes)
+                || !containsMidAutumn(sourceTypes)) {
+            return false;
+        }
+        return containsMidAutumn(splitCodes(sourceDay.getFestivalTags()));
+    }
+
+    private List<BaselineCalendarDay> filterCombinedHolidayDates(BaselineCalendarDay targetDay,
+                                                                  List<BaselineCalendarDay> sourceDays) {
+        if (!containsNationalDay(holidayTypes(targetDay))) {
+            return sourceDays;
+        }
+        Map<String, List<BaselineCalendarDay>> groups = sourceDays.stream()
+                .collect(java.util.stream.Collectors.groupingBy(this::holidayGroup,
+                        LinkedHashMap::new, java.util.stream.Collectors.toList()));
+        List<BaselineCalendarDay> result = new ArrayList<>();
+        for (List<BaselineCalendarDay> group : groups.values()) {
+            boolean combined = group.stream().map(this::holidayTypes)
+                    .anyMatch(types -> containsNationalDay(types) && containsMidAutumn(types));
+            if (combined && group.stream().noneMatch(day ->
+                    containsMidAutumn(splitCodes(day.getFestivalTags())))) {
+                continue;
+            }
+            group.stream().filter(day -> !isExcludedMidAutumnDate(targetDay, day)).forEach(result::add);
+        }
+        return result;
+    }
+
+    private Set<String> holidayTypes(BaselineCalendarDay day) {
+        Set<String> result = splitCodes(day.getHolidayCode());
+        if (result.isEmpty() && day.getHolidayName() != null) {
+            result = splitCodes(day.getHolidayName());
+        }
+        return result;
+    }
+
+    private Set<String> splitCodes(String value) {
+        if (value == null || value.isBlank()) {
+            return Set.of();
+        }
+        Set<String> result = new LinkedHashSet<>();
+        for (String item : value.split("[,，、]")) {
+            if (!item.isBlank()) {
+                result.add(item.trim());
+            }
+        }
+        return result;
+    }
+
+    private boolean containsNationalDay(Set<String> values) {
+        return values.contains(UserBaselineConstants.HOLIDAY_NATIONAL_DAY) || values.contains("国庆节");
+    }
+
+    private boolean containsMidAutumn(Set<String> values) {
+        return values.contains(UserBaselineConstants.HOLIDAY_MID_AUTUMN) || values.contains("中秋节");
     }
 
     private String chineseSourceType(String sourceType) {

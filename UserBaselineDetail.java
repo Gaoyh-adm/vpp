@@ -48,5 +48,7 @@ public class UserBaselineDetail extends SuperEntity<Long> {
     private LocalDateTime snapshotTime;
     private LocalDateTime generatedAt;
     private LocalDateTime correctedAt;
+    private String syncStatus;
+    private LocalDateTime syncedAt;
     private String calcVersion;
 }

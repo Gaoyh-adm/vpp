@@ -40,6 +40,9 @@ public class BaselineCalendarDay extends SuperEntity<Long> {
     /** 跨年度同类节假日分组编码 */
     private String holidayGroupCode;
 
+    /** 具体日期的节日标签，多个标签使用英文逗号分隔 */
+    private String festivalTags;
+
     /** 数据来源地址 */
     private String sourceUrl;
 
@@ -55,4 +58,3 @@ public class BaselineCalendarDay extends SuperEntity<Long> {
     /** 中文备注 */
     private String remark;
 }
-
