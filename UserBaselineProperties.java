@@ -22,6 +22,9 @@ public class UserBaselineProperties {
     /** 单次执行的到期修正任务数 */
     private int correctionTaskBatchSize = 20;
 
+    /** 修正任务租约秒数；执行中按批次续约 */
+    private int correctionLeaseSeconds = 300;
+
     /** 算法版本 */
     private String calcVersion = "V1";
 

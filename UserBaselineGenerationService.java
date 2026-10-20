@@ -1,10 +1,12 @@
 package com.vpp.platform.resource.baseline;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.vpp.framework.commons.JacksonUtils;
 import com.vpp.platform.resource.baseline.model.RawBaselineResult;
 import com.vpp.platform.resource.baseline.model.TypicalSampleTrace;
 import com.vpp.platform.resource.baseline.model.UserBaselineJobResult;
+import com.vpp.platform.resource.baseline.model.UserBaselineSlotSummary;
 import com.vpp.platform.resource.baseline.model.UserLoadPoint;
 import com.vpp.platform.resource.entity.AdjustmentDay;
 import com.vpp.platform.resource.entity.AggregateUser;
@@ -62,9 +64,14 @@ public class UserBaselineGenerationService {
                 .eq(UserBaselineRun::getDataDate, dataDate)
                 .eq(UserBaselineRun::getCalcVersion, calcVersion)
                 .last("LIMIT 1"));
-        if (existing != null) {
+        if (existing != null && "SUCCESS".equals(existing.getStatus())) {
             throw new IllegalStateException("业务日期" + dataDate + "、算法版本" + calcVersion
-                    + "已存在生成记录，为避免覆盖已发布结果，本次不重复生成。");
+                    + "已经生成成功，为避免覆盖已发布结果，本次不重复生成。");
+        }
+        if (existing != null && !"FAILED".equals(existing.getStatus())
+                && !"PARTIAL_FAILED".equals(existing.getStatus())) {
+            throw new IllegalStateException("业务日期" + dataDate + "、算法版本" + calcVersion
+                    + "当前运行状态为" + existing.getStatus() + "，不允许并发恢复。");
         }
 
         BaselineCalendarDay targetDay = calendarDayMapper.selectOne(
@@ -86,21 +93,43 @@ public class UserBaselineGenerationService {
         long totalLong = aggregateUserMapper.selectCount(activeUserWrapper());
         int total = Math.toIntExact(totalLong);
         LocalDateTime snapshotTime = LocalDateTime.now();
-        UserBaselineRun run = UserBaselineRun.builder()
-                .dataDate(dataDate)
-                .calcVersion(calcVersion)
-                .status("RUNNING")
-                .totalUserCount(total)
-                .successUserCount(0)
-                .failedUserCount(0)
-                .snapshotTime(snapshotTime)
-                .startedAt(snapshotTime)
-                .build();
-        runMapper.insert(run);
+        boolean recovery = existing != null;
+        UserBaselineRun run;
+        if (recovery) {
+            run = existing;
+            runMapper.update(null, new LambdaUpdateWrapper<UserBaselineRun>()
+                    .eq(UserBaselineRun::getId, run.getId())
+                    .set(UserBaselineRun::getStatus, "RUNNING")
+                    .set(UserBaselineRun::getTotalUserCount, total)
+                    .set(UserBaselineRun::getSuccessUserCount, 0)
+                    .set(UserBaselineRun::getFailedUserCount, 0)
+                    .set(UserBaselineRun::getSnapshotTime, snapshotTime)
+                    .set(UserBaselineRun::getFinishedAt, null)
+                    .set(UserBaselineRun::getErrorMessage, null));
+            run.setStatus("RUNNING");
+            run.setTotalUserCount(total);
+            run.setSuccessUserCount(0);
+            run.setFailedUserCount(0);
+            run.setSnapshotTime(snapshotTime);
+            run.setFinishedAt(null);
+            run.setErrorMessage(null);
+        } else {
+            run = UserBaselineRun.builder()
+                    .dataDate(dataDate)
+                    .calcVersion(calcVersion)
+                    .status("RUNNING")
+                    .totalUserCount(total)
+                    .successUserCount(0)
+                    .failedUserCount(0)
+                    .snapshotTime(snapshotTime)
+                    .startedAt(snapshotTime)
+                    .build();
+            runMapper.insert(run);
+        }
 
         int success = 0;
         int failed = 0;
-        int[] correctionCounts = new int[UserBaselineConstants.POINTS_PER_DAY + 1];
+        int correctionPoints = 0;
         long lastId = 0L;
         int batchSize = Math.max(1, properties.getUserBatchSize());
         try {
@@ -114,12 +143,12 @@ public class UserBaselineGenerationService {
                     break;
                 }
                 BatchResult batchResult = processBatch(run.getId(), dataDate, targetDay, historyDays,
-                        sourceDays, users, snapshotTime, correctionCounts);
+                        sourceDays, users, snapshotTime, recovery);
                 success += batchResult.success();
                 failed += batchResult.failed();
                 lastId = users.get(users.size() - 1).getId();
             }
-            createCorrectionTasks(dataDate, correctionCounts, calcVersion);
+            correctionPoints = reconcileCorrectionTasks(dataDate, calcVersion);
             run.setSuccessUserCount(success);
             run.setFailedUserCount(failed);
             run.setStatus(failed == 0 ? "SUCCESS" : "PARTIAL_FAILED");
@@ -134,7 +163,6 @@ public class UserBaselineGenerationService {
             runMapper.updateById(run);
             throw e;
         }
-        int correctionPoints = java.util.Arrays.stream(correctionCounts).sum();
         return new UserBaselineJobResult(total, success, failed, correctionPoints);
     }
 
@@ -145,7 +173,7 @@ public class UserBaselineGenerationService {
                                      List<BaselineCalendarDay> sourceDays,
                                      List<AggregateUser> users,
                                      LocalDateTime snapshotTime,
-                                     int[] correctionCounts) {
+                                     boolean recovery) {
         List<String> consNos = users.stream().map(AggregateUser::getConsNo)
                 .filter(value -> value != null && !value.isBlank()).distinct().toList();
         List<String> dataDates = sourceDays.stream().map(day -> day.getCalendarDate().toString()).distinct().toList();
@@ -154,37 +182,73 @@ public class UserBaselineGenerationService {
         Map<String, Map<LocalDate, Map<Integer, UserLoadPoint>>> loads = groupLoads(sourcePoints);
         Map<String, Set<LocalDate>> participationByUnit = participationDates(users, sourceDays);
 
-        int success = 0;
+        List<UserBaselineDetail> existingRows = consNos.isEmpty() ? List.of()
+                : detailMapper.selectList(new LambdaQueryWrapper<UserBaselineDetail>()
+                        .eq(UserBaselineDetail::getDataDate, dataDate)
+                        .eq(UserBaselineDetail::getCalcVersion, properties.getCalcVersion())
+                        .in(UserBaselineDetail::getConsNo, consNos));
+        Map<String, List<UserBaselineDetail>> existingByUser = existingRows.stream()
+                .collect(Collectors.groupingBy(UserBaselineDetail::getConsNo));
+
         int failed = 0;
-        List<UserRows> calculatedUsers = new ArrayList<>(users.size());
+        List<UserResumeRows> resumableUsers = new ArrayList<>(users.size());
+        List<UserBaselineDetail> missingDetails = new ArrayList<>();
         for (AggregateUser user : users) {
             if (user.getConsNo() == null || user.getConsNo().isBlank()) {
                 failed++;
                 continue;
             }
             try {
-                UserRows rows = calculateUser(runId, dataDate, targetDay, historyDays, user,
-                        participationByUnit.getOrDefault(user.getUnitId(), Set.of()),
-                        loads.getOrDefault(user.getConsNo(), Map.of()), snapshotTime);
-                calculatedUsers.add(rows);
+                List<UserBaselineDetail> saved = existingByUser.getOrDefault(user.getConsNo(), List.of());
+                Map<Integer, UserBaselineDetail> bySlot = detailBySlot(user.getConsNo(), saved);
+                Set<Integer> missingSlots = new LinkedHashSet<>();
+                for (int slot = 1; slot <= UserBaselineConstants.POINTS_PER_DAY; slot++) {
+                    if (!bySlot.containsKey(slot)) {
+                        missingSlots.add(slot);
+                    }
+                }
+                if (!missingSlots.isEmpty()) {
+                    UserRows calculated = calculateUser(runId, dataDate, targetDay, historyDays, user,
+                            participationByUnit.getOrDefault(user.getUnitId(), Set.of()),
+                            loads.getOrDefault(user.getConsNo(), Map.of()), snapshotTime, missingSlots);
+                    calculated.details().forEach(detail -> bySlot.put(detail.getSlotNo(), detail));
+                    missingDetails.addAll(calculated.details());
+                }
+                List<UserBaselineDetail> complete = bySlot.values().stream()
+                        .sorted(Comparator.comparing(UserBaselineDetail::getSlotNo)).toList();
+                if (complete.size() != UserBaselineConstants.POINTS_PER_DAY) {
+                    throw new IllegalStateException("户号" + user.getConsNo() + "持久化明细不完整，实际"
+                            + complete.size() + "点。");
+                }
+                resumableUsers.add(new UserResumeRows(complete));
             } catch (Exception e) {
                 failed++;
                 log.error("[用户基线] 户号生成失败，户号={}，业务日期={}", user.getConsNo(), dataDate, e);
             }
         }
-        insertDetails(calculatedUsers.stream().flatMap(rows -> rows.details().stream()).toList());
-        for (UserRows rows : calculatedUsers) {
+        insertDetails(missingDetails);
+
+        int success = 0;
+        for (UserResumeRows rows : resumableUsers) {
             String consNo = rows.details().getFirst().getConsNo();
             try {
-                loadStore.replaceUserDate(consNo, dataDate, rows.loads());
-                int synced = detailMapper.markUserDateSynced(dataDate, consNo, properties.getCalcVersion(),
-                        LocalDateTime.now());
-                if (synced != rows.details().size()) {
-                    throw new IllegalStateException("户号" + consNo + "原始基线已写入TDengine，但MySQL同步状态更新数量异常，"
-                            + "期望" + rows.details().size() + "条，实际" + synced + "条。");
+                List<UserBaselineDetail> pending = rows.details().stream()
+                        .filter(detail -> !UserBaselineConstants.SYNCED.equals(detail.getSyncStatus()))
+                        .toList();
+                if (!pending.isEmpty()) {
+                    List<UserBaselineLoad> loadsToSync = pending.stream().map(this::toLoadRow).toList();
+                    if (recovery || pending.size() != UserBaselineConstants.POINTS_PER_DAY) {
+                        loadStore.upsertPoints(loadsToSync);
+                    } else {
+                        loadStore.replaceUserDate(consNo, dataDate, loadsToSync);
+                    }
+                    int synced = detailMapper.markUserDateSynced(dataDate, consNo, properties.getCalcVersion(),
+                            LocalDateTime.now());
+                    if (synced != rows.details().size()) {
+                        throw new IllegalStateException("户号" + consNo + "基线已写入TDengine，但MySQL同步状态更新数量异常，"
+                                + "期望" + rows.details().size() + "条，实际" + synced + "条。");
+                    }
                 }
-                rows.details().stream().filter(detail -> Boolean.TRUE.equals(detail.getNeedCorrection()))
-                        .forEach(detail -> correctionCounts[detail.getSlotNo()]++);
                 success++;
             } catch (Exception e) {
                 failed++;
@@ -208,10 +272,10 @@ public class UserBaselineGenerationService {
                                    AggregateUser user,
                                    Set<LocalDate> participationDates,
                                    Map<LocalDate, Map<Integer, UserLoadPoint>> loadsByDate,
-                                   LocalDateTime snapshotTime) {
-        List<UserBaselineDetail> details = new ArrayList<>(UserBaselineConstants.POINTS_PER_DAY);
-        List<UserBaselineLoad> resultRows = new ArrayList<>(UserBaselineConstants.POINTS_PER_DAY);
-        for (int slot = 1; slot <= UserBaselineConstants.POINTS_PER_DAY; slot++) {
+                                   LocalDateTime snapshotTime,
+                                   Set<Integer> slots) {
+        List<UserBaselineDetail> details = new ArrayList<>(slots.size());
+        for (Integer slot : slots) {
             List<TypicalSampleTrace> samples = sampleSelector.select(targetDay, historyDays,
                     participationDates, loadsByDate, slot);
             RawBaselineResult raw = pointCalculator.calculateRaw(samples);
@@ -244,9 +308,8 @@ public class UserBaselineGenerationService {
                     .calcVersion(properties.getCalcVersion())
                     .build();
             details.add(detail);
-            resultRows.add(toLoadRow(detail));
         }
-        return new UserRows(details, resultRows);
+        return new UserRows(details);
     }
 
     private UserBaselineLoad toLoadRow(UserBaselineDetail detail) {
@@ -254,12 +317,16 @@ public class UserBaselineGenerationService {
                 .ts(Timestamp.valueOf(detail.getTargetTime()))
                 .slotNo(detail.getSlotNo())
                 .rawBaselineE6(storageSupport.toScaledLong(detail.getRawBaselineMw()))
+                .actualWindowMeanE6(storageSupport.toScaledLong(detail.getActualWindowMeanMw()))
+                .baselineWindowMeanE6(storageSupport.toScaledLong(detail.getBaselineWindowMeanMw()))
+                .kE6(storageSupport.toScaledLong(detail.getKValue()))
                 .finalBaselineE6(storageSupport.toScaledLong(detail.getFinalBaselineMw()))
                 .correctionStatus(detail.getCorrectionStatus())
                 .calculationRemark(detail.getCalculationRemark())
                 .traceId(detail.getTraceCode())
                 .calcVersion(detail.getCalcVersion())
                 .generatedAt(Timestamp.valueOf(detail.getGeneratedAt()))
+                .correctedAt(detail.getCorrectedAt() == null ? null : Timestamp.valueOf(detail.getCorrectedAt()))
                 .consNo(detail.getConsNo())
                 .dataDate(detail.getDataDate().toString())
                 .build();
@@ -340,31 +407,70 @@ public class UserBaselineGenerationService {
                 .isNotNull(AggregateUser::getConsNo);
     }
 
-    private void createCorrectionTasks(LocalDate dataDate, int[] correctionCounts, String calcVersion) {
-        for (int slot = 1; slot <= UserBaselineConstants.POINTS_PER_DAY; slot++) {
-            if (correctionCounts[slot] <= 0) {
+    private Map<Integer, UserBaselineDetail> detailBySlot(String consNo, List<UserBaselineDetail> details) {
+        Map<Integer, UserBaselineDetail> result = new HashMap<>();
+        for (UserBaselineDetail detail : details) {
+            if (detail == null || detail.getSlotNo() == null || detail.getSlotNo() < 1
+                    || detail.getSlotNo() > UserBaselineConstants.POINTS_PER_DAY) {
+                throw new IllegalStateException("户号" + consNo + "存在点序号非法的基线明细。");
+            }
+            if (result.put(detail.getSlotNo(), detail) != null) {
+                throw new IllegalStateException("户号" + consNo + "第" + detail.getSlotNo() + "点存在重复基线明细。");
+            }
+        }
+        return result;
+    }
+
+    private int reconcileCorrectionTasks(LocalDate dataDate, String calcVersion) {
+        List<UserBaselineSlotSummary> summaries = detailMapper.selectCorrectionSlotSummaries(dataDate, calcVersion);
+        int correctionPoints = 0;
+        for (UserBaselineSlotSummary summary : summaries) {
+            int slot = summary.getSlotNo();
+            int totalCount = summary.getTotalCount() == null ? 0 : summary.getTotalCount();
+            int waitingCount = summary.getWaitingCount() == null ? 0 : summary.getWaitingCount();
+            if (slot < 1 || slot > UserBaselineConstants.POINTS_PER_DAY || totalCount <= 0) {
+                throw new IllegalStateException("持久化修正明细的点位统计非法，点序号=" + slot + "，数量=" + totalCount);
+            }
+            correctionPoints += totalCount;
+            LocalDateTime targetTime = storageSupport.slotTime(dataDate, slot);
+            UserBaselineCorrectionTask task = taskMapper.selectOne(
+                    new LambdaQueryWrapper<UserBaselineCorrectionTask>()
+                            .eq(UserBaselineCorrectionTask::getDataDate, dataDate)
+                            .eq(UserBaselineCorrectionTask::getSlotNo, slot)
+                            .eq(UserBaselineCorrectionTask::getCalcVersion, calcVersion)
+                            .last("LIMIT 1"));
+            if (task == null) {
+                task = UserBaselineCorrectionTask.builder()
+                        .dataDate(dataDate)
+                        .slotNo(slot)
+                        .targetTime(targetTime)
+                        .scheduledTime(targetTime)
+                        .status(UserBaselineConstants.TASK_PENDING)
+                        .totalCount(totalCount)
+                        .successCount(0)
+                        .failedCount(0)
+                        .retryCount(0)
+                        .calcVersion(calcVersion)
+                        .build();
+                taskMapper.insert(task);
                 continue;
             }
-            LocalDateTime targetTime = storageSupport.slotTime(dataDate, slot);
-            UserBaselineCorrectionTask task = UserBaselineCorrectionTask.builder()
-                    .dataDate(dataDate)
-                    .slotNo(slot)
-                    .targetTime(targetTime)
-                    .scheduledTime(targetTime)
-                    .status(UserBaselineConstants.TASK_PENDING)
-                    .totalCount(correctionCounts[slot])
-                    .successCount(0)
-                    .failedCount(0)
-                    .retryCount(0)
-                    .calcVersion(calcVersion)
-                    .build();
-            taskMapper.insert(task);
+            if (UserBaselineConstants.TASK_SUCCESS.equals(task.getStatus()) && waitingCount > 0) {
+                if (taskMapper.reopenCompleted(task.getId(), totalCount) == 1) {
+                    continue;
+                }
+            }
+            taskMapper.updateTotalCount(task.getId(), totalCount);
         }
+        return correctionPoints;
     }
 
     private record BatchResult(int success, int failed) {
     }
 
-    private record UserRows(List<UserBaselineDetail> details, List<UserBaselineLoad> loads) {
+    private record UserRows(List<UserBaselineDetail> details) {
+    }
+
+    private record UserResumeRows(List<UserBaselineDetail> details) {
     }
 }

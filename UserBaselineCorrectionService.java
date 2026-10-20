@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 /** 消费时刻级任务并修正发生过典型日剔除的户号点位。 */
 @Slf4j
@@ -39,6 +40,7 @@ public class UserBaselineCorrectionService {
     private final UserBaselinePointCalculator pointCalculator;
     private final UserBaselineStorageSupport storageSupport;
     private final UserBaselineProperties properties;
+    private final String executionOwner = UUID.randomUUID().toString();
 
     /**
      * 查询并执行已经到达目标时刻的修正任务。
@@ -47,13 +49,9 @@ public class UserBaselineCorrectionService {
      * @throws IllegalStateException 任一任务发生系统异常并进入等待重试时抛出
      */
     public int correctDueTasks() {
-        List<UserBaselineCorrectionTask> tasks = taskMapper.selectList(
-                new LambdaQueryWrapper<UserBaselineCorrectionTask>()
-                        .in(UserBaselineCorrectionTask::getStatus,
-                                UserBaselineConstants.TASK_PENDING, UserBaselineConstants.TASK_RETRY_WAIT)
-                        .le(UserBaselineCorrectionTask::getScheduledTime, LocalDateTime.now())
-                        .orderByAsc(UserBaselineCorrectionTask::getScheduledTime)
-                        .last("LIMIT " + Math.max(1, properties.getCorrectionTaskBatchSize())));
+        LocalDateTime now = LocalDateTime.now();
+        List<UserBaselineCorrectionTask> tasks = taskMapper.selectDueRecoverable(
+                now, Math.max(1, properties.getCorrectionTaskBatchSize()));
         int completed = 0;
         int failed = 0;
         for (UserBaselineCorrectionTask task : tasks) {
@@ -82,7 +80,9 @@ public class UserBaselineCorrectionService {
         if (UserBaselineConstants.TASK_SUCCESS.equals(task.getStatus())) {
             return;
         }
-        if (taskMapper.claimForProcessing(taskId) == 0) {
+        LocalDateTime claimTime = LocalDateTime.now();
+        if (taskMapper.claimForProcessing(taskId, executionOwner, claimTime,
+                leaseExpireTime(claimTime)) == 0) {
             UserBaselineCorrectionTask current = taskMapper.selectById(taskId);
             if (current != null && (UserBaselineConstants.TASK_SUCCESS.equals(current.getStatus())
                     || UserBaselineConstants.TASK_PROCESSING.equals(current.getStatus()))) {
@@ -90,6 +90,7 @@ public class UserBaselineCorrectionService {
             }
             throw new IllegalStateException("用户基线修正任务当前状态不允许消费，任务ID=" + taskId);
         }
+        task = taskMapper.selectById(taskId);
 
         try {
             syncPendingDetails(task);
@@ -107,11 +108,14 @@ public class UserBaselineCorrectionService {
                 if (details == null || details.isEmpty()) {
                     break;
                 }
+                renewLease(taskId);
                 calculateBatch(task, details);
                 syncDetails(details);
+                renewLease(taskId);
                 lastId = details.get(details.size() - 1).getId();
             }
             syncPendingDetails(task);
+            renewLease(taskId);
             long waiting = countDetails(task, UserBaselineConstants.STATUS_WAITING, null);
             long pendingSync = countPendingSyncDetails(task);
             if (waiting > 0 || pendingSync > 0) {
@@ -125,17 +129,12 @@ public class UserBaselineCorrectionService {
                 throw new IllegalStateException("用户基线修正任务要求同步" + expected + "条，实际已确认同步"
                         + (success + failed) + "条，不能标记成功。");
             }
-            task.setStatus(UserBaselineConstants.TASK_SUCCESS);
-            task.setSuccessCount(success);
-            task.setFailedCount(failed);
-            task.setCompletedAt(LocalDateTime.now());
-            task.setLastError(null);
-            taskMapper.updateById(task);
+            if (taskMapper.complete(taskId, executionOwner, success, failed, LocalDateTime.now()) != 1) {
+                throw new IllegalStateException("用户基线修正任务完成时执行权已经失效，任务ID=" + taskId);
+            }
         } catch (Exception e) {
-            task.setStatus(UserBaselineConstants.TASK_RETRY_WAIT);
-            task.setRetryCount(task.getRetryCount() == null ? 1 : task.getRetryCount() + 1);
-            task.setLastError("用户基线修正发生系统异常：" + e.getMessage());
-            taskMapper.updateById(task);
+            taskMapper.releaseForRetry(taskId, executionOwner,
+                    "用户基线修正发生系统异常：" + e.getMessage());
             throw e;
         }
     }
@@ -176,14 +175,17 @@ public class UserBaselineCorrectionService {
                     seeds.getOrDefault(detail.getConsNo(), Map.of()));
 
             CorrectionResult result;
+            List<String> missingReasons = new ArrayList<>(2);
             if (actualWindow.missingTime() != null) {
-                String remark = "前4小时实际负荷窗口中的" + actualWindow.missingTime()
-                        + "缺失，已在该点前后各4小时内按照距离由近到远、同距离前值优先的规则查找，仍未找到可用值；"
-                        + "K值为空，最终基线保留原始基线" + detail.getRawBaselineMw().toPlainString() + "兆瓦。";
-                result = uncorrectable(detail, actualWindow.values(), baselineWindow.values(), remark);
-            } else if (baselineWindow.missingTime() != null) {
-                String remark = "前4小时历史最终基线窗口中的" + baselineWindow.missingTime()
-                        + "无法取得已输出结果、最近前值或初始化原始基线；K值为空，最终基线保留原始基线"
+                missingReasons.add("前4小时实际负荷窗口中的" + actualWindow.missingTime()
+                        + "缺失，已在该点前后各4小时内按照距离由近到远、同距离前值优先的规则查找，仍未找到可用值");
+            }
+            if (baselineWindow.missingTime() != null) {
+                missingReasons.add("前4小时历史最终基线窗口中的" + baselineWindow.missingTime()
+                        + "无法取得已输出结果、最近有效前值或初始化原始基线");
+            }
+            if (!missingReasons.isEmpty()) {
+                String remark = String.join("；", missingReasons) + "；K值为空，最终基线保留原始基线"
                         + detail.getRawBaselineMw().toPlainString() + "兆瓦。";
                 result = uncorrectable(detail, actualWindow.values(), baselineWindow.values(), remark);
             } else {
@@ -293,37 +295,66 @@ public class UserBaselineCorrectionService {
                         "采用该历史时点已输出的最终基线", "当前点", 0));
                 continue;
             }
-            UserBaselineLoad previous = source.entrySet().stream()
+            Map.Entry<LocalDateTime, UserBaselineLoad> previousPublished = source.entrySet().stream()
                     .filter(entry -> entry.getKey().isBefore(pointTime))
                     .filter(entry -> entry.getValue().getFinalBaselineE6() != null)
                     .filter(entry -> !UserBaselineConstants.STATUS_WAITING.equals(
                             entry.getValue().getCorrectionStatus()))
                     .max(Map.Entry.comparingByKey())
-                    .map(Map.Entry::getValue)
                     .orElse(null);
-            if (previous != null) {
-                LocalDateTime previousTime = previous.getTs().toLocalDateTime();
+            InitialBaselineSeed seed = seeds.get(pointTime);
+            boolean exactSeedUsable = seed != null && seed.rawResult() != null
+                    && seed.rawResult().rawBaseline() != null;
+            if (exactSeedUsable && previousPublished != null) {
+                UserBaselineLoad previous = previousPublished.getValue();
+                LocalDateTime previousTime = previousPublished.getKey();
                 int distance = Math.toIntExact(java.time.Duration.between(previousTime, pointTime).toMinutes());
                 result.add(new WindowValueTrace(pointTime, previousTime,
                         storageSupport.fromScaledLong(previous.getFinalBaselineE6()),
                         "历史最终基线缺失，采用最近有效前值", "前值", distance));
                 continue;
             }
-            InitialBaselineSeed seed = seeds.get(pointTime);
-            if (seed == null || seed.rawResult() == null) {
-                return new WindowBuild(result, pointTime);
+            if (exactSeedUsable) {
+                result.add(new WindowValueTrace(pointTime, seed.pointTime(), seed.rawResult().rawBaseline(),
+                        "首次启动缺少历史最终基线，采用历史业务日期" + seed.dataDate() + "第"
+                                + seed.slotNo() + "点单独计算并保存的B0；" + seed.rawResult().chineseRemark(),
+                        "初始化种子", 0));
+                continue;
             }
-            if (seed.rawResult().rawBaseline() == null) {
+            Map.Entry<LocalDateTime, InitialBaselineSeed> previousSeed = seeds.entrySet().stream()
+                    .filter(entry -> entry.getKey().isBefore(pointTime))
+                    .filter(entry -> entry.getValue() != null && entry.getValue().rawResult() != null)
+                    .filter(entry -> entry.getValue().rawResult().rawBaseline() != null)
+                    .max(Map.Entry.comparingByKey())
+                    .orElse(null);
+            boolean useInitializationPrevious = previousSeed != null && (previousPublished == null
+                    || previousSeed.getKey().isAfter(previousPublished.getKey()));
+            if (useInitializationPrevious) {
+                InitialBaselineSeed previousSeedValue = previousSeed.getValue();
+                int distance = Math.toIntExact(java.time.Duration.between(
+                        previousSeed.getKey(), pointTime).toMinutes());
+                result.add(new WindowValueTrace(pointTime, previousSeed.getKey(),
+                        previousSeedValue.rawResult().rawBaseline(),
+                        "当前初始化点缺失或无有效B0，采用最近有效初始化前值；该补值仅用于本次计算，不修改初始化记录和已发布结果",
+                        "初始化前值", distance));
+                continue;
+            }
+            if (previousPublished != null) {
+                UserBaselineLoad previous = previousPublished.getValue();
+                LocalDateTime previousTime = previousPublished.getKey();
+                int distance = Math.toIntExact(java.time.Duration.between(previousTime, pointTime).toMinutes());
+                result.add(new WindowValueTrace(pointTime, previousTime,
+                        storageSupport.fromScaledLong(previous.getFinalBaselineE6()),
+                        "历史最终基线和当前初始化点缺失，采用最近有效已发布前值", "前值", distance));
+                continue;
+            }
+            if (seed != null && seed.rawResult() != null) {
                 result.add(new WindowValueTrace(pointTime, seed.pointTime(), null,
                         "首次初始化已按历史业务日期" + seed.dataDate() + "第" + seed.slotNo()
                                 + "点计算B0，但未取得有效结果；" + seed.rawResult().chineseRemark(),
                         "初始化失败", 0));
-                return new WindowBuild(result, pointTime);
             }
-            result.add(new WindowValueTrace(pointTime, seed.pointTime(), seed.rawResult().rawBaseline(),
-                    "首次启动缺少历史最终基线，采用历史业务日期" + seed.dataDate() + "第"
-                            + seed.slotNo() + "点单独计算并保存的B0；" + seed.rawResult().chineseRemark(),
-                    "初始化种子", 0));
+            return new WindowBuild(result, pointTime);
         }
         return new WindowBuild(result, null);
     }
@@ -352,6 +383,7 @@ public class UserBaselineCorrectionService {
     private void syncPendingDetails(UserBaselineCorrectionTask task) {
         long lastId = 0L;
         while (true) {
+            renewLease(task.getId());
             List<UserBaselineDetail> pending = detailMapper.selectList(
                     new LambdaQueryWrapper<UserBaselineDetail>()
                             .eq(UserBaselineDetail::getDataDate, task.getDataDate())
@@ -368,8 +400,20 @@ public class UserBaselineCorrectionService {
                 return;
             }
             syncDetails(pending);
+            renewLease(task.getId());
             lastId = pending.get(pending.size() - 1).getId();
         }
+    }
+
+    private void renewLease(Long taskId) {
+        LocalDateTime now = LocalDateTime.now();
+        if (taskMapper.renewLease(taskId, executionOwner, now, leaseExpireTime(now)) != 1) {
+            throw new IllegalStateException("用户基线修正任务租约续期失败，任务ID=" + taskId);
+        }
+    }
+
+    private LocalDateTime leaseExpireTime(LocalDateTime now) {
+        return now.plusSeconds(Math.max(30, properties.getCorrectionLeaseSeconds()));
     }
 
     // TDengine幂等覆盖成功后，逐条确认MySQL同步状态。

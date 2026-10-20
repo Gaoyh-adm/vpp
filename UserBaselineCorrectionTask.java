@@ -31,5 +31,8 @@ public class UserBaselineCorrectionTask extends SuperEntity<Long> {
     private Integer retryCount;
     private String lastError;
     private String calcVersion;
+    private String executionOwner;
+    private LocalDateTime leaseExpireTime;
+    private LocalDateTime heartbeatTime;
     private LocalDateTime completedAt;
 }
