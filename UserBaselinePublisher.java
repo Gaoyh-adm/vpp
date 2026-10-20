@@ -11,7 +11,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 
-/** 单实例内统一发布原始基线及修正结果，协调两阶段写入顺序。 */
+/** 使用本地锁和MySQL专用行锁协调原始基线及修正结果发布。 */
 @Service
 @RequiredArgsConstructor
 public class UserBaselinePublisher {
@@ -26,14 +26,18 @@ public class UserBaselinePublisher {
     private final UserBaselineLoadStore loadStore;
     private final UserBaselineStorageSupport storageSupport;
     private final UserBaselinePersistenceService persistenceService;
+    private final UserBaselinePublicationMutex publicationMutex;
 
     // Spring单例中的同一把锁；只协调保存和发布，选样及K计算在锁外。
     private final ReentrantLock publicationLock = new ReentrantLock();
 
     public int publish(List<Long> detailIds) {
+        if (detailIds == null || detailIds.isEmpty()) {
+            return 0;
+        }
         publicationLock.lock();
         try {
-            return publishLocked(detailIds);
+            return publicationMutex.execute(() -> publishLocked(detailIds));
         } finally {
             publicationLock.unlock();
         }
@@ -47,13 +51,16 @@ public class UserBaselinePublisher {
         }
         publicationLock.lock();
         try {
-            List<Long> ids = calculated.stream().map(UserBaselineDetail::getId).toList();
-            // 从MySQL重新读；初次发布失败则先补写B0，失败时不提交修正。
-            publishLocked(ids);
-            // 独立Bean中的MySQL事务在返回前提交，接着才发布修正值。
-            List<UserBaselineDetail> saved = persistenceService.saveCorrections(
-                    taskId, owner, calculated);
-            return publishLocked(saved.stream().map(UserBaselineDetail::getId).toList());
+            return publicationMutex.execute(() -> {
+                List<Long> ids = calculated.stream().map(UserBaselineDetail::getId).toList();
+                // 仍先保证原始B0已经发布。
+                publishLocked(ids);
+                // 业务MySQL事务独立提交；此时专用锁连接仍然持锁。
+                List<UserBaselineDetail> saved = persistenceService.saveCorrections(
+                        taskId, owner, calculated);
+                // 保存后重新读取当前结果，并发布修正值。
+                return publishLocked(saved.stream().map(UserBaselineDetail::getId).toList());
+            });
         } finally {
             publicationLock.unlock();
         }
