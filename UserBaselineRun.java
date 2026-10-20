@@ -30,5 +30,7 @@ public class UserBaselineRun extends SuperEntity<Long> {
     private LocalDateTime startedAt;
     private LocalDateTime finishedAt;
     private String errorMessage;
+    private String executionOwner;
+    private LocalDateTime leaseExpireTime;
+    private LocalDateTime heartbeatTime;
 }
-

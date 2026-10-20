@@ -32,7 +32,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-/** 计算并持久化户号首次修正所需的16点历史原始基线。 */
+/** 计算并读取户号首次修正所需的16点历史原始基线。 */
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -69,18 +69,18 @@ public class UserBaselineInitialWindowService {
     }
 
     /**
-     * 只为尚无初始化记录的户号创建一次完整窗口；每个历史点按自己的业务日期和点序号计算B0。
+     * 只为尚无初始化记录的户号计算完整窗口；持久化由持有任务执行权的短事务完成。
      *
      * @param details 需要判断首次初始化的修正明细
      * @param firstTargetTime 首次修正目标时刻
      * @param calcVersion 算法版本
-     * @return 已存在及本次新建的初始化窗口
+     * @return 本次需要首次保存的初始化窗口
      * @throws IllegalStateException 历史点缺少日历或初始化内容不完整时抛出
      */
-    public Map<String, Map<LocalDateTime, InitialBaselineSeed>> initializeOnce(
+    public List<UserBaselineInitialWindow> buildMissingWindows(
             List<UserBaselineDetail> details, LocalDateTime firstTargetTime, String calcVersion) {
         if (details == null || details.isEmpty()) {
-            return Map.of();
+            return List.of();
         }
         List<String> consNos = details.stream().map(UserBaselineDetail::getConsNo)
                 .filter(value -> value != null && !value.isBlank()).distinct().toList();
@@ -89,7 +89,7 @@ public class UserBaselineInitialWindowService {
                 .filter(detail -> !existing.containsKey(detail.getConsNo()))
                 .toList();
         if (pending.isEmpty()) {
-            return existing;
+            return List.of();
         }
 
         List<HistoricalPoint> points = historicalPoints(firstTargetTime);
@@ -128,7 +128,6 @@ public class UserBaselineInitialWindowService {
         Map<String, Set<LocalDate>> participationByUnit = participationDates(pending, allSourceDays);
 
         List<UserBaselineInitialWindow> inserts = new ArrayList<>(pending.size());
-        Map<String, Map<LocalDateTime, InitialBaselineSeed>> created = new HashMap<>();
         LocalDateTime initializedAt = LocalDateTime.now();
         for (UserBaselineDetail detail : pending) {
             List<InitialBaselineSeed> seeds = new ArrayList<>(UserBaselineConstants.WINDOW_POINTS);
@@ -153,12 +152,8 @@ public class UserBaselineInitialWindowService {
                             + "后续仅滚动使用该初始化窗口，不再次初始化。")
                     .build();
             inserts.add(row);
-            created.put(detail.getConsNo(), seeds.stream().collect(Collectors.toMap(
-                    InitialBaselineSeed::pointTime, seed -> seed, (left, right) -> left)));
         }
-        initialWindowMapper.insert(inserts);
-        existing.putAll(created);
-        return existing;
+        return inserts;
     }
 
     private Map<LocalDateTime, InitialBaselineSeed> seedMap(UserBaselineInitialWindow row) {

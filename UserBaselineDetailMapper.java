@@ -16,22 +16,36 @@ import java.util.List;
 @Repository
 public interface UserBaselineDetailMapper extends SuperMapper<UserBaselineDetail> {
 
-    /**
-     * 原始96点完整写入TDengine后，确认该户当日明细已经同步。
-     *
-     * @param dataDate 业务日期
-     * @param consNo 户号
-     * @param calcVersion 算法版本
-     * @param syncedAt 同步完成时间
-     * @return 更新行数
-     */
-    @Update("UPDATE ra_user_baseline_detail SET sync_status='SYNCED', synced_at=#{syncedAt}, "
-            + "last_modify_time=NOW(3) WHERE data_date=#{dataDate} AND cons_no=#{consNo} "
-            + "AND calc_version=#{calcVersion} AND deleted=0")
-    int markUserDateSynced(@Param("dataDate") LocalDate dataDate,
-                           @Param("consNo") String consNo,
-                           @Param("calcVersion") String calcVersion,
-                           @Param("syncedAt") LocalDateTime syncedAt);
+    @Update("UPDATE ra_user_baseline_detail SET sync_status='SYNCED',synced_at=NOW(3),"
+            + "last_modify_time=NOW(3) WHERE id=#{id} AND calc_version=#{calcVersion} AND deleted=0 "
+            + "AND correction_status=#{sentStatus} AND correction_status IN "
+            + "('NOT_REQUIRED','NO_BASELINE','CORRECTED','UNCORRECTABLE') AND sync_status='PENDING'")
+    int confirmPublished(@Param("id") Long id, @Param("calcVersion") String calcVersion,
+                         @Param("sentStatus") String sentStatus);
+
+    @Select("SELECT * FROM ra_user_baseline_detail WHERE id=#{id} AND deleted=0 FOR UPDATE")
+    UserBaselineDetail selectForUpdate(@Param("id") Long id);
+
+    @Update("UPDATE ra_user_baseline_detail SET actual_window_json=#{detail.actualWindowJson},"
+            + "baseline_window_json=#{detail.baselineWindowJson},actual_window_mean_mw=#{detail.actualWindowMeanMw},"
+            + "baseline_window_mean_mw=#{detail.baselineWindowMeanMw},k_value=#{detail.kValue},"
+            + "final_baseline_mw=#{detail.finalBaselineMw},correction_status=#{detail.correctionStatus},"
+            + "calculation_remark=#{detail.calculationRemark},corrected_at=#{detail.correctedAt},"
+            + "sync_status='PENDING',synced_at=NULL,last_modify_time=NOW(3) WHERE id=#{detail.id} "
+            + "AND calc_version=#{detail.calcVersion} AND correction_status='WAITING' AND deleted=0")
+    int updateWaitingCorrection(@Param("detail") UserBaselineDetail detail);
+
+    @Select({"<script>",
+            "SELECT DISTINCT cons_no FROM ra_user_baseline_detail WHERE deleted=0 AND calc_version=#{calcVersion}",
+            "AND target_time&gt;=#{startTime} AND target_time&lt;#{targetTime}",
+            "AND (correction_status='WAITING' OR (correction_status IN",
+            "('NOT_REQUIRED','NO_BASELINE','CORRECTED','UNCORRECTABLE') AND sync_status&lt;&gt;'SYNCED'))",
+            "AND cons_no IN <foreach collection='consNos' item='consNo' open='(' separator=',' close=')'>#{consNo}</foreach>",
+            "</script>"})
+    List<String> selectUnreadyHistoryUsers(@Param("consNos") List<String> consNos,
+                                            @Param("calcVersion") String calcVersion,
+                                            @Param("startTime") LocalDateTime startTime,
+                                            @Param("targetTime") LocalDateTime targetTime);
 
     /** 按点位汇总需要修正的持久化明细，用于恢复时补建或校准任务。 */
     @Select("SELECT slot_no, COUNT(*) AS total_count, "

@@ -6,7 +6,9 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDate;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /** 用户基线TDengine结果存储。 */
 @Service
@@ -43,6 +45,7 @@ public class UserBaselineLoadStore {
     public void upsertPoint(UserBaselineLoad row) {
         String tableName = storageSupport.tableName(row.getConsNo());
         storageSupport.validateTableName(tableName);
+        userBaselineLoadMapper.ensureTable(tableName, row.getConsNo());
         row.setTbname(tableName);
         userBaselineLoadMapper.insert(row);
     }
@@ -52,11 +55,14 @@ public class UserBaselineLoadStore {
         if (rows == null || rows.isEmpty()) {
             return;
         }
+        Map<String, String> tables = new LinkedHashMap<>();
         rows.forEach(row -> {
             String tableName = storageSupport.tableName(row.getConsNo());
             storageSupport.validateTableName(tableName);
+            tables.putIfAbsent(tableName, row.getConsNo());
             row.setTbname(tableName);
         });
+        tables.forEach(userBaselineLoadMapper::ensureTable);
         int batchSize = Math.max(1, properties.getWriteBatchSize());
         for (int start = 0; start < rows.size(); start += batchSize) {
             userBaselineLoadMapper.insert(rows.subList(start, Math.min(start + batchSize, rows.size())));

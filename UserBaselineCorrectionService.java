@@ -35,12 +35,13 @@ public class UserBaselineCorrectionService {
     private final UserBaselineDetailMapper detailMapper;
     private final UserBaselineSourceMapper sourceMapper;
     private final UserBaselineLoadMapper loadMapper;
-    private final UserBaselineLoadStore loadStore;
     private final UserBaselineInitialWindowService initialWindowService;
+    private final UserBaselinePersistenceService persistenceService;
+    private final UserBaselinePublisher publisher;
+    private final UserBaselineLeaseHeartbeat leaseHeartbeat;
     private final UserBaselinePointCalculator pointCalculator;
     private final UserBaselineStorageSupport storageSupport;
     private final UserBaselineProperties properties;
-    private final String executionOwner = UUID.randomUUID().toString();
 
     /**
      * 查询并执行已经到达目标时刻的修正任务。
@@ -49,9 +50,8 @@ public class UserBaselineCorrectionService {
      * @throws IllegalStateException 任一任务发生系统异常并进入等待重试时抛出
      */
     public int correctDueTasks() {
-        LocalDateTime now = LocalDateTime.now();
         List<UserBaselineCorrectionTask> tasks = taskMapper.selectDueRecoverable(
-                now, Math.max(1, properties.getCorrectionTaskBatchSize()));
+                Math.max(1, properties.getCorrectionTaskBatchSize()));
         int completed = 0;
         int failed = 0;
         for (UserBaselineCorrectionTask task : tasks) {
@@ -73,6 +73,7 @@ public class UserBaselineCorrectionService {
     }
 
     private void correct(Long taskId) {
+        String executionOwner = UUID.randomUUID().toString();
         UserBaselineCorrectionTask task = taskMapper.selectById(taskId);
         if (task == null) {
             throw new IllegalArgumentException("用户基线修正任务不存在，任务ID=" + taskId);
@@ -80,9 +81,8 @@ public class UserBaselineCorrectionService {
         if (UserBaselineConstants.TASK_SUCCESS.equals(task.getStatus())) {
             return;
         }
-        LocalDateTime claimTime = LocalDateTime.now();
-        if (taskMapper.claimForProcessing(taskId, executionOwner, claimTime,
-                leaseExpireTime(claimTime)) == 0) {
+        int leaseSeconds = Math.max(30, properties.getCorrectionLeaseSeconds());
+        if (taskMapper.claimForProcessing(taskId, executionOwner, leaseSeconds) == 0) {
             UserBaselineCorrectionTask current = taskMapper.selectById(taskId);
             if (current != null && (UserBaselineConstants.TASK_SUCCESS.equals(current.getStatus())
                     || UserBaselineConstants.TASK_PROCESSING.equals(current.getStatus()))) {
@@ -92,7 +92,9 @@ public class UserBaselineCorrectionService {
         }
         task = taskMapper.selectById(taskId);
 
-        try {
+        try (UserBaselineLeaseHeartbeat.LeaseHandle heartbeat = leaseHeartbeat.start(
+                "用户基线修正任务" + taskId, leaseSeconds,
+                () -> taskMapper.renewLease(taskId, executionOwner, leaseSeconds) == 1)) {
             syncPendingDetails(task);
             long lastId = 0L;
             while (true) {
@@ -108,14 +110,23 @@ public class UserBaselineCorrectionService {
                 if (details == null || details.isEmpty()) {
                     break;
                 }
-                renewLease(taskId);
-                calculateBatch(task, details);
-                syncDetails(details);
-                renewLease(taskId);
+                heartbeat.assertActive();
+                List<String> consNos = details.stream().map(UserBaselineDetail::getConsNo).distinct().toList();
+                List<String> unready = detailMapper.selectUnreadyHistoryUsers(consNos, task.getCalcVersion(),
+                        task.getTargetTime().minusHours(4), task.getTargetTime());
+                List<UserBaselineDetail> ready = details.stream()
+                        .filter(detail -> !unready.contains(detail.getConsNo())).toList();
+                if (!ready.isEmpty()) {
+                    List<UserBaselineDetail> calculated = calculateBatch(taskId, executionOwner, task, ready);
+                    heartbeat.assertActive();
+                    List<UserBaselineDetail> saved = persistenceService.saveCorrections(
+                            taskId, executionOwner, calculated);
+                    publisher.publish(saved.stream().map(UserBaselineDetail::getId).toList());
+                }
                 lastId = details.get(details.size() - 1).getId();
             }
             syncPendingDetails(task);
-            renewLease(taskId);
+            heartbeat.assertActive();
             long waiting = countDetails(task, UserBaselineConstants.STATUS_WAITING, null);
             long pendingSync = countPendingSyncDetails(task);
             if (waiting > 0 || pendingSync > 0) {
@@ -129,7 +140,7 @@ public class UserBaselineCorrectionService {
                 throw new IllegalStateException("用户基线修正任务要求同步" + expected + "条，实际已确认同步"
                         + (success + failed) + "条，不能标记成功。");
             }
-            if (taskMapper.complete(taskId, executionOwner, success, failed, LocalDateTime.now()) != 1) {
+            if (taskMapper.complete(taskId, executionOwner, success, failed) != 1) {
                 throw new IllegalStateException("用户基线修正任务完成时执行权已经失效，任务ID=" + taskId);
             }
         } catch (Exception e) {
@@ -139,7 +150,9 @@ public class UserBaselineCorrectionService {
         }
     }
 
-    private void calculateBatch(UserBaselineCorrectionTask task, List<UserBaselineDetail> details) {
+    private List<UserBaselineDetail> calculateBatch(Long taskId, String executionOwner,
+                                                     UserBaselineCorrectionTask task,
+                                                     List<UserBaselineDetail> details) {
         List<String> consNos = details.stream().map(UserBaselineDetail::getConsNo).distinct().toList();
         LocalDateTime targetTime = task.getTargetTime();
         LocalDateTime queryStart = targetTime.minusHours(8);
@@ -163,8 +176,10 @@ public class UserBaselineCorrectionService {
             }
         }
         if (!needInitialization.isEmpty()) {
-            seeds.putAll(initialWindowService.initializeOnce(
-                    needInitialization, targetTime, task.getCalcVersion()));
+            persistenceService.saveInitialWindows(taskId, executionOwner,
+                    initialWindowService.buildMissingWindows(
+                            needInitialization, targetTime, task.getCalcVersion()));
+            seeds = initialWindowService.findByUsers(consNos, task.getCalcVersion());
         }
 
         for (UserBaselineDetail detail : details) {
@@ -205,10 +220,8 @@ public class UserBaselineCorrectionService {
             detail.setCorrectedAt(correctedAt);
             detail.setSyncStatus(UserBaselineConstants.SYNC_PENDING);
             detail.setSyncedAt(null);
-            if (detailMapper.updateById(detail) != 1) {
-                throw new IllegalStateException("用户基线修正结果保存失败，明细ID=" + detail.getId());
-            }
         }
+        return details;
     }
 
     private int countCompletedDetails(UserBaselineCorrectionTask task, String correctionStatus) {
@@ -383,7 +396,6 @@ public class UserBaselineCorrectionService {
     private void syncPendingDetails(UserBaselineCorrectionTask task) {
         long lastId = 0L;
         while (true) {
-            renewLease(task.getId());
             List<UserBaselineDetail> pending = detailMapper.selectList(
                     new LambdaQueryWrapper<UserBaselineDetail>()
                             .eq(UserBaselineDetail::getDataDate, task.getDataDate())
@@ -399,55 +411,9 @@ public class UserBaselineCorrectionService {
             if (pending == null || pending.isEmpty()) {
                 return;
             }
-            syncDetails(pending);
-            renewLease(task.getId());
+            publisher.publish(pending.stream().map(UserBaselineDetail::getId).toList());
             lastId = pending.get(pending.size() - 1).getId();
         }
-    }
-
-    private void renewLease(Long taskId) {
-        LocalDateTime now = LocalDateTime.now();
-        if (taskMapper.renewLease(taskId, executionOwner, now, leaseExpireTime(now)) != 1) {
-            throw new IllegalStateException("用户基线修正任务租约续期失败，任务ID=" + taskId);
-        }
-    }
-
-    private LocalDateTime leaseExpireTime(LocalDateTime now) {
-        return now.plusSeconds(Math.max(30, properties.getCorrectionLeaseSeconds()));
-    }
-
-    // TDengine幂等覆盖成功后，逐条确认MySQL同步状态。
-    private void syncDetails(List<UserBaselineDetail> details) {
-        List<UserBaselineLoad> rows = details.stream().map(this::toUpdatedLoad).toList();
-        loadStore.upsertPoints(rows);
-        LocalDateTime syncedAt = LocalDateTime.now();
-        for (UserBaselineDetail detail : details) {
-            detail.setSyncStatus(UserBaselineConstants.SYNCED);
-            detail.setSyncedAt(syncedAt);
-            if (detailMapper.updateById(detail) != 1) {
-                throw new IllegalStateException("TDengine写入成功，但MySQL同步状态确认失败，明细ID=" + detail.getId());
-            }
-        }
-    }
-
-    private UserBaselineLoad toUpdatedLoad(UserBaselineDetail detail) {
-        return UserBaselineLoad.builder()
-                .ts(Timestamp.valueOf(detail.getTargetTime()))
-                .slotNo(detail.getSlotNo())
-                .rawBaselineE6(storageSupport.toScaledLong(detail.getRawBaselineMw()))
-                .actualWindowMeanE6(storageSupport.toScaledLong(detail.getActualWindowMeanMw()))
-                .baselineWindowMeanE6(storageSupport.toScaledLong(detail.getBaselineWindowMeanMw()))
-                .kE6(storageSupport.toScaledLong(detail.getKValue()))
-                .finalBaselineE6(storageSupport.toScaledLong(detail.getFinalBaselineMw()))
-                .correctionStatus(detail.getCorrectionStatus())
-                .calculationRemark(detail.getCalculationRemark())
-                .traceId(detail.getTraceCode())
-                .calcVersion(detail.getCalcVersion())
-                .generatedAt(Timestamp.valueOf(detail.getGeneratedAt()))
-                .correctedAt(detail.getCorrectedAt() == null ? null : Timestamp.valueOf(detail.getCorrectedAt()))
-                .consNo(detail.getConsNo())
-                .dataDate(detail.getDataDate().toString())
-                .build();
     }
 
     private CorrectionResult uncorrectable(UserBaselineDetail detail,

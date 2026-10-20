@@ -1,7 +1,6 @@
 package com.vpp.platform.resource.baseline;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.vpp.framework.commons.JacksonUtils;
 import com.vpp.platform.resource.baseline.model.RawBaselineResult;
 import com.vpp.platform.resource.baseline.model.TypicalSampleTrace;
@@ -13,7 +12,6 @@ import com.vpp.platform.resource.entity.AggregateUser;
 import com.vpp.platform.resource.entity.BaselineCalendarDay;
 import com.vpp.platform.resource.entity.UserBaselineCorrectionTask;
 import com.vpp.platform.resource.entity.UserBaselineDetail;
-import com.vpp.platform.resource.entity.UserBaselineLoad;
 import com.vpp.platform.resource.entity.UserBaselineRun;
 import com.vpp.platform.resource.repository.AdjustmentDayMapper;
 import com.vpp.platform.resource.repository.AggregateUserMapper;
@@ -25,8 +23,8 @@ import com.vpp.platform.resource.repository.UserBaselineSourceMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.dao.DuplicateKeyException;
 
-import java.sql.Timestamp;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -38,6 +36,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.UUID;
 
 /** 按户号分批生成当日96点原始基线。 */
 @Slf4j
@@ -52,7 +51,9 @@ public class UserBaselineGenerationService {
     private final UserBaselineRunMapper runMapper;
     private final UserBaselineDetailMapper detailMapper;
     private final UserBaselineCorrectionTaskMapper taskMapper;
-    private final UserBaselineLoadStore loadStore;
+    private final UserBaselinePersistenceService persistenceService;
+    private final UserBaselinePublisher publisher;
+    private final UserBaselineLeaseHeartbeat leaseHeartbeat;
     private final TypicalSampleSelector sampleSelector;
     private final UserBaselinePointCalculator pointCalculator;
     private final UserBaselineStorageSupport storageSupport;
@@ -60,80 +61,38 @@ public class UserBaselineGenerationService {
 
     public UserBaselineJobResult generate(LocalDate dataDate) {
         String calcVersion = properties.getCalcVersion();
-        UserBaselineRun existing = runMapper.selectOne(new LambdaQueryWrapper<UserBaselineRun>()
-                .eq(UserBaselineRun::getDataDate, dataDate)
-                .eq(UserBaselineRun::getCalcVersion, calcVersion)
-                .last("LIMIT 1"));
-        if (existing != null && "SUCCESS".equals(existing.getStatus())) {
-            throw new IllegalStateException("业务日期" + dataDate + "、算法版本" + calcVersion
-                    + "已经生成成功，为避免覆盖已发布结果，本次不重复生成。");
-        }
-        if (existing != null && !"FAILED".equals(existing.getStatus())
-                && !"PARTIAL_FAILED".equals(existing.getStatus())) {
-            throw new IllegalStateException("业务日期" + dataDate + "、算法版本" + calcVersion
-                    + "当前运行状态为" + existing.getStatus() + "，不允许并发恢复。");
-        }
-
-        BaselineCalendarDay targetDay = calendarDayMapper.selectOne(
-                new LambdaQueryWrapper<BaselineCalendarDay>()
-                        .eq(BaselineCalendarDay::getCalendarDate, dataDate)
-                        .last("LIMIT 1"));
-        if (targetDay == null) {
-            throw new IllegalStateException("业务日期" + dataDate + "尚未维护日历，不能生成用户基线。");
-        }
-        List<BaselineCalendarDay> historyDays = calendarDayMapper.selectList(
-                new LambdaQueryWrapper<BaselineCalendarDay>()
-                        .lt(BaselineCalendarDay::getCalendarDate, dataDate)
-                        .orderByDesc(BaselineCalendarDay::getCalendarDate));
-        List<BaselineCalendarDay> sourceDays = sourceDays(targetDay, historyDays);
-        if (sourceDays.isEmpty()) {
-            throw new IllegalStateException("业务日期" + dataDate + "没有可用的候选日历范围。");
-        }
-
         long totalLong = aggregateUserMapper.selectCount(activeUserWrapper());
         int total = Math.toIntExact(totalLong);
         LocalDateTime snapshotTime = LocalDateTime.now();
-        boolean recovery = existing != null;
-        UserBaselineRun run;
-        if (recovery) {
-            run = existing;
-            runMapper.update(null, new LambdaUpdateWrapper<UserBaselineRun>()
-                    .eq(UserBaselineRun::getId, run.getId())
-                    .set(UserBaselineRun::getStatus, "RUNNING")
-                    .set(UserBaselineRun::getTotalUserCount, total)
-                    .set(UserBaselineRun::getSuccessUserCount, 0)
-                    .set(UserBaselineRun::getFailedUserCount, 0)
-                    .set(UserBaselineRun::getSnapshotTime, snapshotTime)
-                    .set(UserBaselineRun::getFinishedAt, null)
-                    .set(UserBaselineRun::getErrorMessage, null));
-            run.setStatus("RUNNING");
-            run.setTotalUserCount(total);
-            run.setSuccessUserCount(0);
-            run.setFailedUserCount(0);
-            run.setSnapshotTime(snapshotTime);
-            run.setFinishedAt(null);
-            run.setErrorMessage(null);
-        } else {
-            run = UserBaselineRun.builder()
-                    .dataDate(dataDate)
-                    .calcVersion(calcVersion)
-                    .status("RUNNING")
-                    .totalUserCount(total)
-                    .successUserCount(0)
-                    .failedUserCount(0)
-                    .snapshotTime(snapshotTime)
-                    .startedAt(snapshotTime)
-                    .build();
-            runMapper.insert(run);
-        }
+        String executionOwner = UUID.randomUUID().toString();
+        int leaseSeconds = Math.max(30, properties.getCorrectionLeaseSeconds());
+        UserBaselineRun run = acquireRun(dataDate, calcVersion, total, snapshotTime,
+                executionOwner, leaseSeconds);
 
         int success = 0;
         int failed = 0;
         int correctionPoints = 0;
         long lastId = 0L;
         int batchSize = Math.max(1, properties.getUserBatchSize());
-        try {
+        try (UserBaselineLeaseHeartbeat.LeaseHandle heartbeat = leaseHeartbeat.start(
+                "用户基线每日生成" + run.getId(), leaseSeconds,
+                () -> runMapper.renewLease(run.getId(), executionOwner, leaseSeconds) == 1)) {
+            BaselineCalendarDay targetDay = calendarDayMapper.selectOne(
+                    new LambdaQueryWrapper<BaselineCalendarDay>()
+                            .eq(BaselineCalendarDay::getCalendarDate, dataDate).last("LIMIT 1"));
+            if (targetDay == null) {
+                throw new IllegalStateException("业务日期" + dataDate + "尚未维护日历，不能生成用户基线。");
+            }
+            List<BaselineCalendarDay> historyDays = calendarDayMapper.selectList(
+                    new LambdaQueryWrapper<BaselineCalendarDay>()
+                            .lt(BaselineCalendarDay::getCalendarDate, dataDate)
+                            .orderByDesc(BaselineCalendarDay::getCalendarDate));
+            List<BaselineCalendarDay> sourceDays = sourceDays(targetDay, historyDays);
+            if (sourceDays.isEmpty()) {
+                throw new IllegalStateException("业务日期" + dataDate + "没有可用的候选日历范围。");
+            }
             while (true) {
+                heartbeat.assertActive();
                 LambdaQueryWrapper<AggregateUser> wrapper = activeUserWrapper()
                         .gt(AggregateUser::getId, lastId)
                         .orderByAsc(AggregateUser::getId)
@@ -142,38 +101,64 @@ public class UserBaselineGenerationService {
                 if (users == null || users.isEmpty()) {
                     break;
                 }
-                BatchResult batchResult = processBatch(run.getId(), dataDate, targetDay, historyDays,
-                        sourceDays, users, snapshotTime, recovery);
+                BatchResult batchResult = processBatch(run.getId(), executionOwner, dataDate, targetDay,
+                        historyDays, sourceDays, users, snapshotTime);
                 success += batchResult.success();
                 failed += batchResult.failed();
                 lastId = users.get(users.size() - 1).getId();
             }
             correctionPoints = reconcileCorrectionTasks(dataDate, calcVersion);
-            run.setSuccessUserCount(success);
-            run.setFailedUserCount(failed);
-            run.setStatus(failed == 0 ? "SUCCESS" : "PARTIAL_FAILED");
-            run.setFinishedAt(LocalDateTime.now());
-            runMapper.updateById(run);
+            heartbeat.assertActive();
+            String finalStatus = failed == 0 ? "SUCCESS" : "PARTIAL_FAILED";
+            if (runMapper.complete(run.getId(), executionOwner, finalStatus, success, failed) != 1) {
+                throw new IllegalStateException("用户基线每日生成完成时执行权已经失效，运行ID=" + run.getId());
+            }
         } catch (Exception e) {
-            run.setSuccessUserCount(success);
-            run.setFailedUserCount(Math.max(failed, total - success));
-            run.setStatus("FAILED");
-            run.setFinishedAt(LocalDateTime.now());
-            run.setErrorMessage("用户基线生成失败：" + e.getMessage());
-            runMapper.updateById(run);
+            runMapper.releaseForFailure(run.getId(), executionOwner, success,
+                    Math.max(failed, total - success), "用户基线生成失败：" + e.getMessage());
             throw e;
         }
         return new UserBaselineJobResult(total, success, failed, correctionPoints);
     }
 
-    private BatchResult processBatch(Long runId,
+    private UserBaselineRun acquireRun(LocalDate dataDate, String calcVersion, int total,
+                                       LocalDateTime snapshotTime, String owner, int leaseSeconds) {
+        UserBaselineRun existing = findRun(dataDate, calcVersion);
+        if (existing == null) {
+            UserBaselineRun created = UserBaselineRun.builder().dataDate(dataDate).calcVersion(calcVersion)
+                    .status("RUNNING").totalUserCount(total).successUserCount(0).failedUserCount(0)
+                    .snapshotTime(snapshotTime).startedAt(snapshotTime).build();
+            try {
+                runMapper.insertRunning(created, owner, leaseSeconds);
+                return created;
+            } catch (DuplicateKeyException ignored) {
+                existing = findRun(dataDate, calcVersion);
+            }
+        }
+        if (existing == null || "SUCCESS".equals(existing.getStatus())) {
+            throw new IllegalStateException("业务日期" + dataDate + "、算法版本" + calcVersion
+                    + "已经生成成功或运行记录异常，不允许重复生成。");
+        }
+        if (runMapper.claimForProcessing(existing.getId(), owner, leaseSeconds) != 1) {
+            throw new IllegalStateException("业务日期" + dataDate + "、算法版本" + calcVersion
+                    + "存在未过期执行者，不能并发恢复。");
+        }
+        return existing;
+    }
+
+    private UserBaselineRun findRun(LocalDate dataDate, String calcVersion) {
+        return runMapper.selectOne(new LambdaQueryWrapper<UserBaselineRun>()
+                .eq(UserBaselineRun::getDataDate, dataDate)
+                .eq(UserBaselineRun::getCalcVersion, calcVersion).last("LIMIT 1"));
+    }
+
+    private BatchResult processBatch(Long runId, String executionOwner,
                                      LocalDate dataDate,
                                      BaselineCalendarDay targetDay,
                                      List<BaselineCalendarDay> historyDays,
                                      List<BaselineCalendarDay> sourceDays,
                                      List<AggregateUser> users,
-                                     LocalDateTime snapshotTime,
-                                     boolean recovery) {
+                                     LocalDateTime snapshotTime) {
         List<String> consNos = users.stream().map(AggregateUser::getConsNo)
                 .filter(value -> value != null && !value.isBlank()).distinct().toList();
         List<String> dataDates = sourceDays.stream().map(day -> day.getCalendarDate().toString()).distinct().toList();
@@ -191,7 +176,7 @@ public class UserBaselineGenerationService {
                 .collect(Collectors.groupingBy(UserBaselineDetail::getConsNo));
 
         int failed = 0;
-        List<UserResumeRows> resumableUsers = new ArrayList<>(users.size());
+        List<String> resumableUsers = new ArrayList<>(users.size());
         List<UserBaselineDetail> missingDetails = new ArrayList<>();
         for (AggregateUser user : users) {
             if (user.getConsNo() == null || user.getConsNo().isBlank()) {
@@ -220,35 +205,34 @@ public class UserBaselineGenerationService {
                     throw new IllegalStateException("户号" + user.getConsNo() + "持久化明细不完整，实际"
                             + complete.size() + "点。");
                 }
-                resumableUsers.add(new UserResumeRows(complete));
+                resumableUsers.add(user.getConsNo());
             } catch (Exception e) {
                 failed++;
                 log.error("[用户基线] 户号生成失败，户号={}，业务日期={}", user.getConsNo(), dataDate, e);
             }
         }
-        insertDetails(missingDetails);
+        persistenceService.saveGeneratedDetails(runId, executionOwner, missingDetails);
+        List<UserBaselineDetail> persisted = consNos.isEmpty() ? List.of()
+                : detailMapper.selectList(new LambdaQueryWrapper<UserBaselineDetail>()
+                        .eq(UserBaselineDetail::getDataDate, dataDate)
+                        .eq(UserBaselineDetail::getCalcVersion, properties.getCalcVersion())
+                        .in(UserBaselineDetail::getConsNo, consNos));
+        Map<String, List<UserBaselineDetail>> persistedByUser = persisted.stream()
+                .collect(Collectors.groupingBy(UserBaselineDetail::getConsNo));
 
         int success = 0;
-        for (UserResumeRows rows : resumableUsers) {
-            String consNo = rows.details().getFirst().getConsNo();
+        for (String consNo : resumableUsers) {
             try {
-                List<UserBaselineDetail> pending = rows.details().stream()
-                        .filter(detail -> !UserBaselineConstants.SYNCED.equals(detail.getSyncStatus()))
-                        .toList();
-                if (!pending.isEmpty()) {
-                    List<UserBaselineLoad> loadsToSync = pending.stream().map(this::toLoadRow).toList();
-                    if (recovery || pending.size() != UserBaselineConstants.POINTS_PER_DAY) {
-                        loadStore.upsertPoints(loadsToSync);
-                    } else {
-                        loadStore.replaceUserDate(consNo, dataDate, loadsToSync);
-                    }
-                    int synced = detailMapper.markUserDateSynced(dataDate, consNo, properties.getCalcVersion(),
-                            LocalDateTime.now());
-                    if (synced != rows.details().size()) {
-                        throw new IllegalStateException("户号" + consNo + "基线已写入TDengine，但MySQL同步状态更新数量异常，"
-                                + "期望" + rows.details().size() + "条，实际" + synced + "条。");
-                    }
+                List<UserBaselineDetail> rows = persistedByUser.getOrDefault(consNo, List.of());
+                if (rows.size() != UserBaselineConstants.POINTS_PER_DAY) {
+                    throw new IllegalStateException("户号" + consNo + "持久化明细不完整，实际" + rows.size() + "点。");
                 }
+                List<Long> pendingFinalIds = rows.stream()
+                        .filter(detail -> UserBaselinePublisher.isFinalStatus(detail.getCorrectionStatus()))
+                        .filter(detail -> UserBaselineConstants.SYNC_PENDING.equals(detail.getSyncStatus()))
+                        .map(UserBaselineDetail::getId)
+                        .toList();
+                publisher.publish(pendingFinalIds);
                 success++;
             } catch (Exception e) {
                 failed++;
@@ -256,13 +240,6 @@ public class UserBaselineGenerationService {
             }
         }
         return new BatchResult(success, failed);
-    }
-
-    private void insertDetails(List<UserBaselineDetail> details) {
-        int writeBatchSize = Math.max(1, properties.getDetailWriteBatchSize());
-        for (int start = 0; start < details.size(); start += writeBatchSize) {
-            detailMapper.insert(details.subList(start, Math.min(start + writeBatchSize, details.size())));
-        }
     }
 
     private UserRows calculateUser(Long runId,
@@ -310,26 +287,6 @@ public class UserBaselineGenerationService {
             details.add(detail);
         }
         return new UserRows(details);
-    }
-
-    private UserBaselineLoad toLoadRow(UserBaselineDetail detail) {
-        return UserBaselineLoad.builder()
-                .ts(Timestamp.valueOf(detail.getTargetTime()))
-                .slotNo(detail.getSlotNo())
-                .rawBaselineE6(storageSupport.toScaledLong(detail.getRawBaselineMw()))
-                .actualWindowMeanE6(storageSupport.toScaledLong(detail.getActualWindowMeanMw()))
-                .baselineWindowMeanE6(storageSupport.toScaledLong(detail.getBaselineWindowMeanMw()))
-                .kE6(storageSupport.toScaledLong(detail.getKValue()))
-                .finalBaselineE6(storageSupport.toScaledLong(detail.getFinalBaselineMw()))
-                .correctionStatus(detail.getCorrectionStatus())
-                .calculationRemark(detail.getCalculationRemark())
-                .traceId(detail.getTraceCode())
-                .calcVersion(detail.getCalcVersion())
-                .generatedAt(Timestamp.valueOf(detail.getGeneratedAt()))
-                .correctedAt(detail.getCorrectedAt() == null ? null : Timestamp.valueOf(detail.getCorrectedAt()))
-                .consNo(detail.getConsNo())
-                .dataDate(detail.getDataDate().toString())
-                .build();
     }
 
     private Map<String, Map<LocalDate, Map<Integer, UserLoadPoint>>> groupLoads(List<UserLoadPoint> points) {
@@ -471,6 +428,4 @@ public class UserBaselineGenerationService {
     private record UserRows(List<UserBaselineDetail> details) {
     }
 
-    private record UserResumeRows(List<UserBaselineDetail> details) {
-    }
 }
