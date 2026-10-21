@@ -1,0 +1,30 @@
+结构核验通过：959户 × 30天 × 96点 = 2,761,920条，NULL负荷424条。
+逐行检查全部时间戳、data_date、日期、子表映射及每户每日96点；跨日00:00归属上一业务日。
+Java隔离检查通过：23个预期点，含单独初始化种子校验；使用仓库真实TypicalSampleSelector、UserBaselinePointCalculator、两个窗口构建方法的代码。
+隔离运行仅替代框架注解、实体getter与数据访问；日历按星期、参与日期为空，需以MySQL前置检查为准。
+本报告不表示已执行TDengine/MySQL导入或完整Spring任务，导入及联调请在测试环境验证。
+
+PASS S01 samples=5 fitted=0 removed=0 B0=10.000000 K=null final=10.000000 NOT_REQUIRED
+PASS S02 samples=5 fitted=0 removed=0 B0=10.000000 K=null final=10.000000 NOT_REQUIRED
+PASS S03 samples=5 fitted=4 removed=0 B0=10.000000 K=null final=10.000000 NOT_REQUIRED
+PASS S04 samples=5 fitted=1 removed=0 B0=10.000000 K=null final=10.000000 NOT_REQUIRED
+PASS S05 samples=1 fitted=0 removed=0 B0=10.000000 K=null final=10.000000 NOT_REQUIRED
+PASS S06 samples=0 fitted=0 removed=0 B0=null K=null final=null NO_BASELINE
+PASS S07 samples=5 fitted=0 removed=0 B0=12.000000 K=null final=12.000000 NOT_REQUIRED
+PASS S08 samples=5 fitted=0 removed=1 B0=10.000000 K=1.200000 final=12.000000 CORRECTED
+PASS S09 samples=5 fitted=0 removed=1 B0=10.000000 K=1.200000 final=12.000000 CORRECTED
+PASS S10 samples=5 fitted=0 removed=1 B0=10.000000 K=0.800000 final=8.000000 CORRECTED
+PASS S11 samples=5 fitted=0 removed=1 B0=10.000000 K=0.000000 final=0.000000 CORRECTED
+PASS S12 samples=5 fitted=0 removed=1 B0=10.000000 K=null final=10.000000 UNCORRECTABLE
+PASS S13 samples=5 fitted=0 removed=1 B0=10.000000 K=1.175000 final=11.750000 CORRECTED
+PASS S14 samples=5 fitted=0 removed=1 B0=10.000000 K=1.225000 final=12.250000 CORRECTED
+PASS S15 samples=5 fitted=0 removed=1 B0=10.000000 K=null final=10.000000 UNCORRECTABLE
+PASS S16 samples=5 fitted=0 removed=1 B0=10.000000 K=1.200000 final=12.000000 CORRECTED
+PASS S17 samples=5 fitted=0 removed=2 B0=10.000000 K=1.200000 final=12.000000 CORRECTED
+PASS S18 samples=5 fitted=0 removed=1 B0=17.500000 K=1.200000 final=21.000000 CORRECTED
+PASS S19 samples=2 fitted=0 removed=1 B0=10.000000 K=1.200000 final=12.000000 CORRECTED
+PASS S20 samples=5 fitted=0 removed=0 B0=0.000000 K=null final=0.000000 NOT_REQUIRED
+PASS S01-MIDNIGHT samples=5 fitted=0 removed=1 B0=10.000000 K=1.000000 final=10.000000 CORRECTED
+PASS S09-ROLLING samples=5 fitted=0 removed=1 B0=10.000000 K=1.185185 final=11.851851 CORRECTED
+PASS S01-REST samples=5 fitted=0 removed=0 B0=20.000000 K=null final=20.000000 NOT_REQUIRED
+Algorithm cases passed: 23
