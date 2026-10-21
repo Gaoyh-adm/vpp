@@ -8,8 +8,8 @@
 
 ## 执行顺序
 
-1. 本包SQL直接使用现有TDengine数据库`vpp_resource`，不创建新库。先执行`00_TDengine_建表.sql`：创建与实体兼容的源超级表、结果超级表及959个按户号划分的子表。cons_no为TAG，ts/load_mw/src_type/data_date为普通列。建表使用IF NOT EXISTS，保留已有表结构；不DROP/DELETE实际负荷。已有超级表的列与TAG须和脚本DDL一致，IF NOT EXISTS不会自动修改已有表结构。
-2. 按日期执行`load/`内全部30份SQL，文件均自带USE。每户每天一条96行INSERT，避免逐点执行；SQL中的多行VALUES用TDengine格式，不使用MySQL存储过程或递归CTE。
+1. 本包SQL直接使用现有TDengine数据库`vpp_resource`，不创建新库。先执行`00_TDengine_建表.sql`：按已确认结构创建源超级表（已存在则保留）、结果超级表及28,770个按“户号＋业务日期”划分的负荷子表。cons_no NCHAR(40)、data_date NCHAR(10)均为TAG；普通列为ts TIMESTAMP、load_mw DOUBLE、src_type NCHAR(20)。建表使用IF NOT EXISTS，保留已有表结构；不DROP/DELETE实际负荷。已有超级表的列与TAG须和脚本DDL一致，IF NOT EXISTS不会自动修改已有表结构。
+2. 按日期执行`load/`内全部30份SQL，文件均自带USE。每户每天一张固定日期子表、一条96行INSERT；INSERT只写ts、load_mw、src_type，户号和日期从子表TAG读取。SQL中的多行VALUES用TDengine格式，不使用MySQL存储过程或递归CTE。
 3. 程序继续使用现有`td-resource`数据源连接`vpp_resource`，无需切换数据库配置；源负荷和基线结果均在此库。MySQL仍需有名单中的有效用户及日历。
 4. 执行`01_MySQL_前置检查.sql`：确认20个重点户号有效、主验证日前5个工作日为2026-10-20, 2026-10-19, 2026-10-16, 2026-10-15, 2026-10-14，且所属聚合单元没有影响这些日期的参与标记。该SQL不修改用户、日历或参与记录。无效户号不会被基线任务处理，959个导入户号不一定等于893个有效户号。
 5. 执行`02_TDengine_导入核验.sql`；核对记录数量及缺点。
@@ -19,7 +19,7 @@
 
 ## 边界和前提
 
-- 15分钟点为00:15、00:30……次日00:00；最后一个点data_date仍为前一天，导入与程序使用同一业务时区Asia/Shanghai。
+- 15分钟点为00:15、00:30……次日00:00；最后一个点所在子表的data_date TAG仍为前一天，导入与程序使用同一业务时区Asia/Shanghai。
 - 不生成法定节假日分支的专门期望值，不修改已有日历。不把10月1日等日期擅自改成普通日。默认负荷按星期构造曲线；代码仍按MySQL实际日历选典型日。
 - 固定数值期望只在预期工作日、参与状态匹配时成立。历史标记不同而样本换天，不可直接判程序错误；先看sample_detail_json。
 - 先找真实值、不足再拟合，因此S02只有缺点不会触发拟合；S03/S04刻意让真实值不足5天。
@@ -31,6 +31,20 @@
 - S12/S15无法修正时，当前代码保存的两个窗口均值字段均为NULL；CSV中的actual_mean/baseline_mean仅解释数学条件，不能要求这些列也写入表。K均为空，最终保留10。
 - 未自动构造“参与日补足”，因为参与属于聚合单元，不能按户号乱标记。未声称仅30天数据可完全验证30工作日/20公休日搜索上限；这需要额外更早的边界样本。
 - 本包只生成SQL，不连接数据库；没有执行实际插入、覆盖或应用配置修改。重跑相同SQL是同时间戳覆盖，缺点保持NULL的行为需要当前TDengine支持明确NULL覆盖。本包按当前空负荷表准备，重复导入时需核对NULL覆盖行为。
+
+## 子表结构和导入示例
+
+用户已确认`st_user_load_96`有两个TAG，按cons_no、data_date顺序。因此同一子表不能跨业务日期复用：959户×30天=28,770张负荷子表。全部子表DDL在`00_TDengine_建表.sql`中。
+
+```sql
+USE vpp_resource;
+CREATE TABLE IF NOT EXISTS fixture_load_f94b99aa657f444f9c3b7892_20261021
+USING st_user_load_96 TAGS ('SD220-001', '2026-10-21');
+INSERT INTO fixture_load_f94b99aa657f444f9c3b7892_20261021
+(ts, load_mw, src_type) VALUES ('2026-10-21 00:15:00.000', 2, 'DEVICE');
+```
+
+原包在创建负荷子表时即报TAG数量不匹配。请用新版完整解压后的文件重新执行；不需要删除或修改超级表。原包的普通列data_date插入方式已去掉，缺点与异常值数据保持原样。
 
 ## 文件说明
 
