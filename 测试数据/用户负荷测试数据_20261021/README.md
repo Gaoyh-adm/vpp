@@ -9,7 +9,7 @@
 ## 执行顺序
 
 1. 本包SQL直接使用现有TDengine数据库`vpp_resource`，不创建新库。先执行`00_TDengine_建表.sql`：按已确认结构创建源超级表（已存在则保留）、结果超级表及28,770个按“户号＋业务日期”划分的负荷子表。cons_no NCHAR(40)、data_date NCHAR(10)均为TAG；普通列为ts TIMESTAMP、load_mw DOUBLE、src_type NCHAR(20)。建表使用IF NOT EXISTS，保留已有表结构；不DROP/DELETE实际负荷。已有超级表的列与TAG须和脚本DDL一致，IF NOT EXISTS不会自动修改已有表结构。
-2. 按日期执行`load/`内全部30份SQL，文件均自带USE。每户每天一张固定日期子表、一条96行INSERT；INSERT只写ts、load_mw、src_type，户号和日期从子表TAG读取。SQL中的多行VALUES用TDengine格式，不使用MySQL存储过程或递归CTE。
+2. 按日期执行`load/`内全部30份SQL，文件均自带USE。每户每天一张固定日期子表、一条包含96组值的单行INSERT；INSERT只写ts、load_mw、src_type，户号和日期从子表TAG读取。每条完整SQL占一行以兼容taos -f，VALUES使用TDengine格式，不使用MySQL存储过程或递归CTE。
 3. 程序继续使用现有`td-resource`数据源连接`vpp_resource`，无需切换数据库配置；源负荷和基线结果均在此库。MySQL仍需有名单中的有效用户及日历。
 4. 执行`01_MySQL_前置检查.sql`：确认20个重点户号有效、主验证日前5个工作日为2026-10-20, 2026-10-19, 2026-10-16, 2026-10-15, 2026-10-14，且所属聚合单元没有影响这些日期的参与标记。该SQL不修改用户、日历或参与记录。无效户号不会被基线任务处理，959个导入户号不一定等于893个有效户号。
 5. 执行`02_TDengine_导入核验.sql`；核对记录数量及缺点。
@@ -38,10 +38,8 @@
 
 ```sql
 USE vpp_resource;
-CREATE TABLE IF NOT EXISTS fixture_load_f94b99aa657f444f9c3b7892_20261021
-USING st_user_load_96 TAGS ('SD220-001', '2026-10-21');
-INSERT INTO fixture_load_f94b99aa657f444f9c3b7892_20261021
-(ts, load_mw, src_type) VALUES ('2026-10-21 00:15:00.000', 2, 'DEVICE');
+CREATE TABLE IF NOT EXISTS fixture_load_f94b99aa657f444f9c3b7892_20261021 USING st_user_load_96 TAGS ('SD220-001', '2026-10-21');
+INSERT INTO fixture_load_f94b99aa657f444f9c3b7892_20261021 (ts, load_mw, src_type) VALUES ('2026-10-21 00:15:00.000', 2, 'DEVICE');
 ```
 
 原包在创建负荷子表时即报TAG数量不匹配。请用新版完整解压后的文件重新执行；不需要删除或修改超级表。原包的普通列data_date插入方式已去掉，缺点与异常值数据保持原样。
@@ -78,3 +76,21 @@ done
 ```
 
 这些命令仅执行TDengine文件；MySQL检查文件应使用MySQL客户端执行。
+
+## 服务器一次导入
+
+本包已将每条完整SQL写在同一行，适配taos -f。旧包的分行VALUES在本次客户端中会被逐行当成独立语句，这是格式问题。
+
+```sh
+cat 00_TDengine_建表.sql load/*.sql > testAll.sql
+taos -u root -p -f "$PWD/testAll.sql"
+```
+
+若服务器已经上传了旧版/root/testAll.sql，可在Linux Shell直接修复格式，不必重新上传数据：
+
+```sh
+awk '/^[[:space:]]*--/ {next} {sub(/\r$/, ""); printf "%s ", $0; if ($0 ~ /;[[:space:]]*$/) printf "\n"}' /root/testAll.sql > /root/testAll_fixed.sql
+taos -u root -p -f /root/testAll_fixed.sql
+```
+
+该awk命令仅针对本包生成的SQL（语句末行以分号结束、无字符串内跨行），保留原文件并生成新文件。无须删除已建好的表。
