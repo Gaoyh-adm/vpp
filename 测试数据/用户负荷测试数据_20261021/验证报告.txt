@@ -28,3 +28,5 @@ PASS S01-MIDNIGHT samples=5 fitted=0 removed=1 B0=10.000000 K=1.000000 final=10.
 PASS S09-ROLLING samples=5 fitted=0 removed=1 B0=10.000000 K=1.185185 final=11.851851 CORRECTED
 PASS S01-REST samples=5 fitted=0 removed=0 B0=20.000000 K=null final=20.000000 NOT_REQUIRED
 Algorithm cases passed: 23
+
+数据库配置调整核验：全部TDengine SQL直接使用vpp_resource，无CREATE DATABASE/DROP/DELETE；30份负荷SQL的数据行与原包完全相同，仅切换库名。
